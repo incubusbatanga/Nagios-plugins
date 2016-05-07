@@ -64,7 +64,7 @@ use constant {
 
 #########################################################################
 
-$VERSION = "0.01";
+$VERSION = "0.1";
 
 ($PROGRAM) = ($0 =~ /([^\/]+)$/);
 
@@ -505,7 +505,100 @@ sub __iosxr_ping(%)
 }
 
 #########################################################################
-##                       J U N O S   D E V I C E                       ##
+##                    F O R C E 1 0   D E V I C E                      ##
+#########################################################################
+
+sub __force10_ping(%)
+{
+    # Get remote session parameters
+    my ($device, $user, $pass, $debug) =
+	@{{@_}}{('device', 'username', 'password', 'debug')};
+
+    return undef unless(defined($device) && $device ne '');
+
+    # Create new telnet session
+    my $conn = Net::Telnet->new(Prompt => '/[a-zA-Z0-9\_\-\+]+[>#]$/',
+				Errmode => 'return',
+				Timeout => 10);
+
+    return undef unless defined($conn);
+
+    # Telnet to Force10 device
+    $conn->open($device)
+	or return undef;
+
+    print "Connected to remote Force10 device ".$device."\n" if $debug;
+
+    # Login to IOS XR device 
+    if(defined($user) && $user ne '' &&
+       defined($pass) && $pass ne '') {
+	print "Logging in\n" if $debug;
+	unless($conn->login($user, $pass)) {
+	    print "Login failed\n" if $debug;
+	    return undef;
+	}
+    }
+
+    print "Authenticated to remote Force10 device ".$device."\n" if $debug;
+
+    # Get ping parameters
+    my ($target, $af, $source, $packets, $size, $timeout, $vrf) =
+	@{{@_}}{('target', 'af', 'source', 'packets', 'size', 'timeout', 'vrf')};
+
+    return undef unless(defined($target) && $target ne '');
+
+    # Set telnet cmd (send command, wait for prompt) timeout
+    $conn->timeout($timeout * ($packets + 1));
+
+    # Format ping command
+    my $cmd = "ping ".$target;
+    # Optional ping source address/interface
+    if(defined($source) && $source ne '') {
+	$cmd .= " source ".$source;
+    }
+    # Optional packet count parameter
+    if(defined($packets) && $packets ne '') {
+	$cmd .= " count ".$packets;
+    }
+    # Optional size parameter
+    if(defined($size) && $size ne '') {
+	$cmd .= " datagram-size ".$size;
+    }
+    # Optional ping timeout parameter
+    if(defined($timeout) && $timeout ne '') {
+	$cmd .= " timeout ".$timeout;
+    }
+
+    # Display debugging if requested
+    print "Executing ".$cmd."\n" if $debug;
+
+    # Issue ping command and get the command's output
+    my @output = $conn->cmd($cmd);
+
+    # End CLI session
+    $conn->put("exit");
+    # Close telnet session
+    $conn->close;
+
+    # The last line of output contains the ping summary
+    my $summary = pop @output;
+    return undef unless defined($summary);
+
+    chomp $summary;
+    return undef unless $summary ne '';
+
+    print $summary."\n" if $debug;
+
+    my %result;
+
+    # Extract summary information
+    @result{('received', 'sent', 'rttmin', 'rttavg', 'rttmax')} = ($summary =~ /^Success rate is \d+(?:\.\d+)? percent \((\d+)\/(\d+)\)(?:, round\-trip min\/avg\/max = (\d+)\/(\d+)\/(\d+) \(ms\))?$/i);
+
+    return \%result;
+}
+
+#########################################################################
+##                      J U N O S   D E V I C E                        ##
 #########################################################################
 
 sub __junos_ping(%)
