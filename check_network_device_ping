@@ -299,7 +299,7 @@ sub __ios_ping(%)
     # Send username, if defined
     if(defined($user) && $user ne '') {
 	print "Sending username\n" if $debug;
-	unless($conn->waitfor('/[Uu]sername:/')) {
+	unless($conn->waitfor('/[Uu]ser(?:name)?:/')) {
 	    print "Username failed\n" if $debug;
 	    return undef;
 	}
@@ -309,7 +309,7 @@ sub __ios_ping(%)
     # Send password, if defined
     if(defined($pass) && $pass ne '') {
 	print "Sending password\n" if $debug;
-	unless($conn->waitfor('/[Pp]assword:/')) {
+	unless($conn->waitfor('/[Pp]ass(?:word)?:/')) {
 	    print "Password failed\n" if $debug;
 	    return undef;
 	}
@@ -424,7 +424,7 @@ sub __iosxr_ping(%)
 
     print "Connected to remote IOS XR device ".$device."\n" if $debug;
 
-    # Login to IOS XR device 
+    # Login to IOS XR device
     if(defined($user) && $user ne '' &&
        defined($pass) && $pass ne '') {
 	print "Logging in\n" if $debug;
@@ -529,7 +529,7 @@ sub __force10_ping(%)
 
     print "Connected to remote Force10 device ".$device."\n" if $debug;
 
-    # Login to IOS XR device 
+    # Login to Force10 device
     if(defined($user) && $user ne '' &&
        defined($pass) && $pass ne '') {
 	print "Logging in\n" if $debug;
@@ -542,8 +542,8 @@ sub __force10_ping(%)
     print "Authenticated to remote Force10 device ".$device."\n" if $debug;
 
     # Get ping parameters
-    my ($target, $af, $source, $packets, $size, $timeout, $vrf) =
-	@{{@_}}{('target', 'af', 'source', 'packets', 'size', 'timeout', 'vrf')};
+    my ($target, $source, $packets, $size, $timeout) =
+	@{{@_}}{('target', 'source', 'packets', 'size', 'timeout')};
 
     return undef unless(defined($target) && $target ne '');
 
@@ -598,6 +598,126 @@ sub __force10_ping(%)
 }
 
 #########################################################################
+##          D E L L   P O W E R C O N N E C T   D E V I C E            ##
+#########################################################################
+
+sub __powerconnect_ping(%)
+{
+    # Get remote session parameters
+    my ($device, $user, $pass, $debug) =
+	@{{@_}}{('device', 'username', 'password', 'debug')};
+
+    return undef unless(defined($device) && $device ne '');
+
+    # Create new telnet session
+    my $conn = Net::Telnet->new(Prompt => '/[a-zA-Z0-9\_\-\+]+[>#]$/',
+				Errmode => 'return',
+				Timeout => 10);
+
+    return undef unless defined($conn);
+
+    # Telnet to PowerConnect device
+    $conn->open($device)
+	or return undef;
+
+    print "Connected to remote Dell PowerConnect device ".$device."\n" if $debug;
+
+    # Send username, if defined
+    if(defined($user) && $user ne '') {
+	print "Sending username\n" if $debug;
+	unless($conn->waitfor('/[Uu]ser(?:name)?:/')) {
+	    print "Username failed\n" if $debug;
+	    return undef;
+	}
+	$conn->put($user."\n");
+    }
+
+    # Send password, if defined
+    if(defined($pass) && $pass ne '') {
+	print "Sending password\n" if $debug;
+	unless($conn->waitfor('/[Pp]ass(?:word)?:/')) {
+	    print "Password failed\n" if $debug;
+	    return undef;
+	}
+	$conn->cmd($pass);
+    }
+
+    print "Authenticated to remote Dell PowerConnect device ".$device."\n" if $debug;
+
+    # Get ping parameters
+    my ($target, $af, $packets, $size, $timeout) =
+	@{{@_}}{('target', 'af', 'packets', 'size', 'timeout',)};
+
+    return undef unless(defined($target) && $target ne '');
+
+    # Set telnet cmd (send command, wait for prompt) timeout
+    $conn->timeout($timeout * ($packets + 1));
+
+    # Format ping command
+    my $cmd = "ping";
+    # Add address family, if defined
+    if(defined($af) && $af ne '') {
+	my $family = {4 => 'ip', 6 => 'ipv6'}->{$af};
+	if(defined($family) && $family ne '') {
+	    $cmd .= " ".$family;
+	}
+    }
+    # Add ping target
+    $cmd .= " ".$target;
+    # Optional packet count parameter
+    if(defined($packets) && $packets ne '') {
+	$cmd .= " repeat ".$packets;
+    # Optional size parameter
+    } elsif(defined($size) && $size ne '') {
+	$cmd .= " size ".$size;
+    # Optional ping timeout parameter
+    } elsif(defined($timeout) && $timeout ne '') {
+	$cmd .= " timeout ".$timeout;
+    }
+
+    # Display debugging if requested
+    print "Executing ".$cmd."\n" if $debug;
+
+    # Issue ping command and get the command's output
+    my @output = $conn->cmd($cmd);
+
+    # End CLI session
+    $conn->put("exit");
+    # Close telnet session
+    $conn->close;
+
+    my %result;
+
+    pop @output;
+
+    # RTT statistics
+    my $rtt_summary = pop @output;
+    return undef unless defined($rtt_summary);
+
+    chomp $rtt_summary;
+    return undef unless $rtt_summary ne '';
+
+    print $rtt_summary."\n" if $debug;
+
+    # Extract summary information
+    @result{('rttmin', 'rttavg', 'rttmax')} = ($rtt_summary =~ /^round\-trip \(msec\) min\/avg\/max = (\d+)\/(\d+)\/(\d+)$/i);
+
+    # Packet loss statistics
+    my $pl_summary = pop @output;
+    return undef unless defined($pl_summary);
+
+    chomp $pl_summary;
+    return undef unless $pl_summary ne '';
+
+    print $pl_summary."\n" if $debug;
+
+    # Extract summary information
+    @result{('sent','received')} = ($pl_summary =~ /^(\d+) packets transmitted, (\d+) packets received, \d+(\.\d+)?% packet loss$/i);
+
+    return \%result;
+}
+
+#########################################################################
 ##                      J U N O S   D E V I C E                        ##
 #########################################################################
 
@@ -622,7 +742,7 @@ sub __junos_ping(%)
 
     print "Connected to remote JunOS device ".$device."\n" if $debug;
 
-    # Login to JunOS device 
+    # Login to JunOS device
     if(defined($user) && $user ne '' &&
        defined($pass) && $pass ne '') {
 	print "Logging in\n" if $debug;
