@@ -1,4 +1,4 @@
-#!/usr/bin/perl
+#!/usr/bin/perl -w
 
 #########################################################################
 
@@ -188,45 +188,45 @@ sub main()
 	    # Set pinging device address
 	    $device = $val;
 	} elsif($opt eq 'T') {
-	    return error "Missing/invalid pinging device type (os/vendor)" unless $val ne '';
+	    return error "Missing/invalid pinging device type (os/vendor)" unless defined($val);
 	    # Set pinging device type
-	    $type = $val;
+	    $type = $val if $val ne '';
 	} elsif($opt eq 'U') {
-	    return error "Missing/invalid pinging device username" unless $val ne '';
+	    return error "Missing pinging device username" unless defined($val);
 	    # Set pinging device's telnet username
-	    $user = $val;
+	    $user = $val if $val ne '';
 	} elsif($opt eq 'P') {
-	    return error "Missing/invalid pinging device password" unless $val ne '';
+	    return error "Missing pinging device password" unless defined($val);
 	    # Set pinging device's telnet password
-	    $pass = $val;
+	    $pass = $val if $val ne '';
 	} elsif($opt eq 'E') {
-	    return error "Missing/invalid pinging device enable password" unless $val ne '';
+	    return error "Missing pinging device enable password" unless defined($val);
 	    # Set pinging device's enable password
-	    $params{'enable'} = $val;
+	    $params{'enable'} = $val if $val ne '';
 	} elsif($opt eq 'H') {
 	    return error "Missing ping target hostname/address" unless $val ne '';
 	    # Set ping target address
 	    $params{'target'} = $val;
 	} elsif($opt eq 'S') {
-	    return error "Missing ping source address/interface" unless $val ne '';
+	    return error "Missing ping source address/interface" unless defined($val);
 	    # Set ping source address
-	    $params{'source'} = $val;
+	    $params{'source'} = $val if $val ne '';
 	} elsif($opt eq 'V') {
-	    return error "Missing/invalid VRF" unless $val ne '';
+	    return error "Missing/invalid VRF" unless defined($val);
 	    # Set pinging source VRF
-	    $params{'vrf'} = $val;
+	    $params{'vrf'} = $val if $val ne '';
 	} elsif($opt eq 'p') {
-	    return error "Missing/invalid packet count" unless($val =~ /^\d+$/ && $val > 0);
+	    return error "Missing packet count" unless defined($val);
 	     # Set the number of packets to ping with
-	    $params{'packets'} = $val;
+	    $params{'packets'} = $val if($val =~ /^\d+$/ && $val > 0);
 	} elsif($opt eq 's') {
-	    return error "Missing/invalid packet size" unless($val =~ /^\d+$/ && $val > 35);
+	    return error "Missing packet size" unless defined($val);
 	    # Set the ping packet size
-	    $params{'size'} = $val;
+	    $params{'size'} = $val if($val =~ /^\d+$/ && $val > 35);
 	} elsif($opt eq 't') {
-	    return error "Missing/invalid ping timeout" unless($val =~ /^\d+$/ && $val > 0);
+	    return error "Missing ping timeout" unless defined($val);
 	    # Set the ping timeout
-	    $params{'timeout'} = $val;
+	    $params{'timeout'} = $val if($val =~ /^\d+$/ && $val > 0);
 	} elsif($opt eq 'w') {
 	    return error "Missing warning thresholds" unless $val ne '';
 	    # Extract average RTT and packed loss thresholds
@@ -742,5 +742,3 @@ sub __junos_ping(%)
 #########################################################################
 
 exit(main());
-
-__END__
