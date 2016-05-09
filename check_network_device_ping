@@ -706,8 +706,9 @@ sub __junos_ping(%)
 
     my %result;
 
-    pop @output;
-    pop @output;
+    # Skip to summary
+    my $last_line = pop @output;
+    pop @output if(defined($last_line) && $last_line !~ /^$/);
 
     # RTT statistics
     my $rtt_summary = pop @output;
