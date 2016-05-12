@@ -21,27 +21,58 @@
 
 #########################################################################
 
-our ($PROGRAM, $VERSION, $USAGE);
-our (%CONFIG, %DEFAULTS);
+our (%PARAMS, %CONFIG, %PARAMS_DEFAULTS, %CONFIG_DEFAULTS);
+our ($PROGRAM, $VERSION);
+our $USAGE;
+
+#########################################################################
+
+($PROGRAM) = ($0 =~ /([^\/]+)$/);
+
+$VERSION = "0.2";
 
 #########################################################################
 ##      O P T I O N A L   S T A T I C   C O N F I G U R A T I O N      ##
 #########################################################################
 
+%PARAMS = ();
 %CONFIG = ();
 
 #########################################################################
 ##                          D E F A U L T S                            ##
 #########################################################################
 
-%DEFAULTS = (
-    'size'	=> 100,
-    'packets'	=> 5,
-    'timeout'	=> 2
+%PARAMS_DEFAULTS = (
+    'size'		=> 100,
+    'packets'		=> 5,
+    'timeout'		=> 2
+);
+
+%CONFIG_DEFAULTS = (
+    'maxattempts'	=> 3,
+    'maxidle'		=> 60,
+    'sockdir'		=> "/var/tmp"
 );
 
 #########################################################################
 ##                         I N T E R N A L S                           ##
+#########################################################################
+
+
+#########################################################################
+
+use constant {
+    RC_OK		=> 0,
+    RC_WARNING		=> 1,
+    RC_CRITICAL		=> 2,
+    RC_UNKNOWN		=> 3
+};
+
+use constant {
+    CLI_PROMPT		=> '.*?[>#]\s*$',
+    PAGE_MARKER		=> '\-+\s*More\s*\-+'
+};
+
 #########################################################################
 
 use strict;
@@ -49,37 +80,30 @@ use warnings;
 
 #########################################################################
 
-use Getopt::Std;
 use Net::Telnet;
 
-#########################################################################
+use Getopt::Std;
 
-use constant {
-    RC_OK	=> 0,
-    RC_WARNING	=> 1,
-    RC_CRITICAL	=> 2,
-    RC_UNKNOWN	=> 3
-};
+use Digest::MD5 qw(md5_base64);
+use IO::Select;
+use IO::Socket::UNIX;
+use Storable qw(nstore_fd fd_retrieve);
 
-use constant {
-    CLI_PROMPT	=> '.*?[>#]\s*$',
-    PAGE_MARKER	=> '\-+\s*More\s*\-+'
-};
+use Data::Dumper;
 
 #########################################################################
-
-$VERSION = "0.1";
-
-($PROGRAM) = ($0 =~ /([^\/]+)$/);
-
-#########################################################################
-##                    H E L P E R   F U N C T I O N S                  ##
+##                   H E L P E R   F U N C T I O N S                   ##
 #########################################################################
 
 sub HELP_MESSAGE
 {
     print STDERR <<EOF
 $PROGRAM [options]
+
+ -H <target_address>          Target (pinged) device's address
+
+ -w <wrta>,<wpl>%             Warning threshold for average RTT and packet loss
+ -c <crta>,<cpl>%             Critical threshold for average RTT and packet loss
 
  -D <remote_address>          Network device that will do the pinging
  -T <type>                    Type of pinging device (os/vendor):
@@ -96,18 +120,14 @@ $PROGRAM [options]
  -P <password>                Pinging device's password
  -E <secret>                  Elevated privilege level secret (ie. Cisco enable)
 
- -H <target_address>          Target (pinged) device's address
- -S <source>                  Ping packets' source address or interface
- -V <VRF>                     VRF to use instead of global routing table
-
  -p <packets>                 Number of pings to send
  -s <size>                    Ping packets' size
  -t <timeout>                 Ping reply timeout
 
- -4|6                         Use IPv4 or IPv6 explicitly
+ -S <source>                  Ping packets' source address or interface
+ -V <VRF>                     VRF to use instead of global routing table
 
- -w <wrta>,<wpl>%             Warning threshold for average RTT and packet loss
- -c <crta>,<cpl>%             Critical threshold for average RTT and packet loss
+ -4|6                         Use IPv4 or IPv6 explicitly
 
  -d                           Enable debugging
 
@@ -120,7 +140,7 @@ sub error(;$)
 
     # If exit message was specified - print it
     if(defined($message) && $message ne '') {
-	print STDERR $message."\n\n";
+	print STDERR "ERROR: ".$message."\n\n";
     }
 
     # Display help
@@ -129,8 +149,127 @@ sub error(;$)
     return RC_UNKNOWN;
 }
 
+sub is_ipv4($)
+{
+    return (defined($_[0]) && $_[0] =~ /^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}(?:\/\d{1,2})?$/) ? 1:0;
+}
+
+sub is_ipv6($)
+{
+    return (defined($_[0]) && $_[0] =~ /^[a-fA-F\d]{0,4}(?:\:(?!\:\:)[a-fA-F\d]{1,4}){0,6}(?:\:\:)?(?:[a-fA-F\d]{1,4}\:(?!\:\:)){0,6}[a-fA-F\d]{0,4}(?:\/\d{1,2})?$/) ? 1:0;
+}
+
+sub nslookup($)
+{
+    my $host = shift;
+    my $addr;
+
+    # getaddrinfo() and getnameinfo() are a mess - they are
+    # missing from Socket module on some linux distributions
+    # (or are otherwise unavailable), but not all. They can
+    # also be found in Socket6 and Socket::GetAddrInfo modules,
+    # but these are not installed by default. We will look for
+    # them in all those places and if they are not found, we
+    # will fall back to shell command 'host' (if installed).
+
+    eval {
+	eval {
+	    eval {
+		# Try Socket module
+		eval {
+		    require Socket;
+		    import Socket qw(getaddrinfo getnameinfo NI_NUMERICHOST NIx_NOSERV);
+		};
+		# If not present in Socket,
+		# look for Socket6 module
+		if($@) {
+		    require Socket6;
+		    import Socket6;
+		}
+	    };
+	    # If Socket6 module is missing,
+	    # look for Socket::GetAddrInfo
+	    if($@) {
+		require Socket::GetAddrInfo;
+		import Socket::GetAddrInfo qw(:newapi getaddrinfo getnameinfo NI_NUMERICHOST);
+	    }
+	    # If we reached this part,
+	    # we found something
+	    my ($err, $ai) = getaddrinfo($host, 0);
+	    ($err, $addr) = getnameinfo($ai->{'addr'}, &NI_NUMERICHOST);
+	};
+	# If all else fails, try good ol' 'host' command
+	if($@) {
+	    ($addr) = (`host $host` =~ /has\s+(?:IPv6\s+)?address\s+([^\s\n\r]+)$/i);
+	    die unless defined($addr) && $addr ne '';
+	}
+    };
+
+    return ($@) ? $host:$addr;
+}
+
 #########################################################################
-##            N E T W O R K   D E V I C E   S U P P O R T              ##
+##             F R O N T E N D < - > D A E M O N   I P C               ##
+#########################################################################
+
+sub ipc_read($)
+{
+    my $socket = shift;
+
+    return fd_retrieve($socket);
+}
+
+sub ipc_write($$)
+{
+    my ($socket, $data) = @_;
+
+    return nstore_fd($data, $socket);
+}
+
+sub ipc_digest($$)
+{
+    my ($user, $pass) = @_;
+
+    $user = '' unless defined($user);
+    $pass = '' unless defined($pass);
+
+    return md5_base64("\0".length($user)."\0".length($pass)."\0".$user.":".$pass);
+}
+
+#########################################################################
+##                     D A E M O N   O U T P U T                       ##
+#########################################################################
+
+sub print_stdout($$)
+{
+    my ($socket, $message) = @_;
+
+    ipc_write($socket, { 'stdout' => $message });
+}
+
+sub print_stderr($$)
+{
+    my ($socket, $message) = @_;
+
+    ipc_write($socket, { 'stderr' => $message });
+}
+
+sub return_code($$)
+{
+    my ($socket, $code) = @_;
+
+    ipc_write($socket, { 'code' => $code });
+}
+
+sub return_stats($$)
+{
+    my ($socket, $stats) = @_;
+
+    ipc_write($socket, { 'stats' => $stats, 'code' => RC_OK });
+}
+
+#########################################################################
+##               N E T W O R K   D E V I C E   C O R E                 ##
 #########################################################################
 
 sub detect_device_type($)
@@ -160,19 +299,257 @@ sub detect_device_type($)
     return '';
 }
 
+sub device_connect($$$$;$)
+{
+    my ($frontend, $device, $user, $pass, $debug) = @_;
+
+    # Create new telnet session
+    my $conn = Net::Telnet->new(Prompt => '/'.CLI_PROMPT.'/',
+				Errmode => 'return',
+				Timeout => 10);
+
+    return undef unless defined($conn);
+
+    # Telnet to remote network device
+    $conn->open($device)
+	or return undef;
+
+    print_stdout($frontend, "Connected to remote network device ".$device."\n") if $debug;
+
+    # Send username, if defined
+    if(defined($user) && $user ne '') {
+	print_stdout($frontend, "Sending username\n") if $debug;
+	unless($conn->waitfor('/(?:[Uu]ser(?:name)?|[Ll]ogin):/')) {
+	    print_stderr($frontend, "Username failed\n") if $debug;
+	    $conn->close();
+	    return undef;
+	}
+	$conn->put($user."\n");
+    }
+
+    # Send password, if defined
+    if(defined($pass) && $pass ne '') {
+	print_stdout($frontend, "Sending password\n") if $debug;
+	unless($conn->waitfor('/[Pp]ass(?:word)?:/')) {
+	    print_stderr($frontend, "Password failed\n") if $debug;
+	    $conn->close();
+	    return undef;
+	}
+	$conn->cmd($pass)
+	    or return undef;
+    }
+
+    print_stdout($frontend, "Authenticated to remote network device ".$device."\n") if $debug;
+
+    return $conn;
+}
+
+sub device_daemon($$;$$$$$)
+{
+    # Fork into background
+    my $pid = fork();
+    return 0 unless defined($pid);
+    return 1 if $pid > 0;
+
+    # Daemon process starts here
+    my ($sockpath, $device, $type, $user, $pass, $debug, $maxidle) = @_;
+    my ($conn, $detected, $ping);
+
+    # Initial daemon process's title
+    my $proctitle = $PROGRAM." daemon";
+    $0 = $proctitle;
+
+    # Remove stale socket if present
+    if(-S $sockpath) {
+	unlink($sockpath);
+    }
+
+    # UNIX socket to talk to our frontend
+    my $listener = IO::Socket::UNIX->new(Type => &SOCK_STREAM,
+					 Local => $sockpath,
+					 Listen => 1,
+					 Blocking => 0);
+
+    exit(RC_UNKNOWN) unless defined($listener);
+
+    # Monitor listener socket
+    my $select = IO::Select->new();
+    $select->add($listener);
+
+    my $idle_timeout = time() + $maxidle;
+
+l:  while(time() < $idle_timeout) {
+
+	$0 = $proctitle.", idle shutdown in ".($idle_timeout - time())." sec";
+
+	# Wait until listening socket is ready
+	my @ready = $select->can_read(0.1);
+	next unless @ready;
+
+	foreach my $socket (@ready) {
+
+	    # If ready socket is the listening socket ...
+	    if($socket == $listener) {
+		# ... we have incoming connection
+		my $frontend = $socket->accept();
+		# Make frontend connection non-blocking
+		$frontend->blocking(0);
+		# Add frontend connection to the monitor
+		$select->add($frontend);
+		next;
+	    }
+
+	    # Get ping parameters from our frontend
+	    my $params = ipc_read($socket);
+
+	    # If socket was ready, but we got no params,
+	    # frontend disconnected from the socket
+	    unless(defined($params)) {
+		print_stderr($socket, "Got no parameters for device ".$device."\n") if $debug;
+		return_code($socket, RC_UNKNOWN);
+		$select->remove($socket);
+		$socket->close();
+		next;
+	    }
+
+	    # Parameters must be 'signed' with MD5 digest
+	    # formatted from device's login credentials.
+	    # This ensures the frontend is invoked with
+	    # proper device credentials while daemon is
+	    # running. Otherwise, device credentials
+	    # would be required only to allow daemon to
+	    # initially authenticate to the remote device,
+	    # but since the session is established from
+	    # that point on, subsequent frontend runs
+	    # would simply land in the middle of already
+	    # established CLI session without auth.
+	    unless($params->{'digest'} eq ipc_digest($user, $pass)) {
+		print_stderr($socket, "Invalid credentials for device ".$device."\n") if $debug;
+		return_code($socket, RC_UNKNOWN);
+		$select->remove($socket);
+		$socket->close();
+		next;
+	    }
+
+	    # If not connected to the device yet ...
+	    unless(defined($conn)) {
+		# ... attempt to connect now
+		$conn = device_connect($socket, $device, $user, $pass, $debug);
+		unless(defined($conn)) {
+		    print_stderr($socket, "Failed to connect to network device ".$device."\n") if $debug;
+		    return_code($socket, RC_UNKNOWN);
+		    $select->remove($socket);
+		    $socket->close();
+		    last l;
+		}
+		# If device type wasn't specified ...
+		unless(defined($type) && $type ne '') {
+		    # ... attempt to detect it
+		    $detected = detect_device_type($conn);
+		    # If device type was detected ...
+		    if(defined($detected) && $detected ne '') {
+			print_stdout($socket, "Detected network device type ".$detected."\n") if $debug;
+			# ... force device-specific ping function lookup
+			undef $ping;
+		    }
+		}
+		# Set telnet cmd (send command, wait for prompt) timeout
+		$conn->timeout($params->{'timeout'} * ($params->{'packets'} + 1));
+		# Set daemon proctitle to reflect connected state
+		$proctitle .= " connected to ".$device;
+		$0 = $proctitle;
+	    }
+
+	    # If device-specific ping function isn't known ...
+	    unless(defined($ping) && ref($ping) eq 'CODE') {
+		my $device_type = (defined($type) && $type ne '') ? $type:$detected;
+		# Determine device-specific ping function
+		$ping = __PACKAGE__->can('__'.$device_type.'_ping');
+		# If device type is supported, platform-specific
+		# ping function exists and we have coderef to it
+		unless(defined($ping) && ref($ping) eq 'CODE') {
+		    # Otherwise, this device type is not supported
+		    print_stderr($socket, "Unsupported device type ".$type."\n") if $debug;
+		    return_code($socket, RC_UNKNOWN);
+		    $select->remove($socket);
+		    $socket->close();
+		    last l;
+		}
+	    }
+
+	    # Reset idle timeout
+	    $idle_timeout = time() + $maxidle;
+
+	    # Ping the target
+	    my $stats = $ping->($socket, $conn, %{$params});
+
+	    # If we received ping statistics ...
+	    if(defined($stats)) {
+		# ... send them to the frontend
+		return_stats($socket, $stats);
+	    # Otherwise ...
+	    } else{
+		# ... return generic error code
+		return_code($socket, RC_UNKNOWN);
+	    }
+
+	    # Disconnect the frontend
+	    $select->remove($socket);
+	    $socket->close();
+	}
+
+    }
+
+    # If connected to the remote device ...
+    if(defined($conn)) {
+	# ... end CLI session
+	$conn->put("exit");
+	# ... close telnet session
+	$conn->close();
+    }
+
+    # If listening on UNIX socket ...
+    if(defined($listener)) {
+	# ... stop monitoring socket
+	$select->remove($listener);
+	# ... close it
+	$listener->close();
+    }
+
+    # If socket file exists ...
+    if(-S $sockpath) {
+	# ... remove it
+	unlink($sockpath);
+    }
+
+    # Done
+    exit(0);
+}
+
 #########################################################################
 ##                              M A I N                                ##
 #########################################################################
 
 sub main()
 {
+    my %cf = (%CONFIG_DEFAULTS, %CONFIG);
+
+    return error "Script config is invalid/incomplete" unless(defined($cf{'maxattempts'}) &&
+								      $cf{'maxattempts'} =~ /^\d+$/ &&
+								      $cf{'maxattempts'} >= 0 &&
+							      defined($cf{'maxidle'}) &&
+								      $cf{'maxidle'} =~ /^\d+$/ &&
+								      $cf{'maxidle'} >= 0 &&
+							      defined($cf{'sockdir'}) &&
+								      -d $cf{'sockdir'});
+
     my %opts = ();
 
     # Parse command line arguments
     $Getopt::Std::STANDARD_HELP_VERSION = 1;
     getopts("D:T:U:P:E:H:S:V:p:s:t:w:c:d46", \%opts);
 
-    my %params = (%DEFAULTS, %CONFIG);
+    my %params = (%PARAMS_DEFAULTS, %PARAMS);
     my ($device, $type);
     my ($user, $pass);
     my ($warn_rta, $warn_pl);
@@ -206,7 +583,7 @@ sub main()
 	} elsif($opt eq 'H') {
 	    return error "Missing ping target hostname/address" unless $val ne '';
 	    # Set ping target address
-	    $params{'target'} = $val;
+	    $params{'target'} = (is_ipv4($val) || is_ipv6($val)) ? $val:nslookup($val);
 	} elsif($opt eq 'S') {
 	    return error "Missing ping source address/interface" unless defined($val);
 	    # Set ping source address
@@ -256,128 +633,176 @@ sub main()
     }
 
     # Check for mandatory parameters: device, target and thresholds
-    return error unless(defined($params{'target'}) && $params{'target'} ne '' &&
-			defined($device) && $device ne '' &&
-			defined($warn_rta) && $warn_rta =~ /^\d+$/ && $warn_rta >= 0 &&
-			defined($warn_pl) && $warn_pl  =~ /^\d+$/ && $warn_pl >= 0 &&
-			defined($crit_rta) && $crit_rta =~ /^\d+$/ && $crit_rta >= 0 &&
-			defined($crit_pl) && $crit_pl =~ /^\d+$/ && $crit_pl >= 0);
+    # and do internal configuration sanity chech
+    return error unless(defined($params{'target'}) &&
+				$params{'target'} ne '' &&
+			defined($device) &&
+				$device ne '' &&
+			defined($warn_rta) &&
+				$warn_rta =~ /^\d+$/ &&
+				$warn_rta >= 0 &&
+			defined($warn_pl) &&
+				$warn_pl  =~ /^\d+$/ &&
+				$warn_pl >= 0 &&
+			defined($crit_rta) &&
+				$crit_rta =~ /^\d+$/ &&
+				$crit_rta >= 0 &&
+			defined($crit_pl) &&
+				$crit_pl =~ /^\d+$/ &&
+				$crit_pl >= 0);
 
-    # Create new telnet session
-    my $conn = Net::Telnet->new(Prompt => '/'.CLI_PROMPT.'/',
-				Errmode => 'return',
-				Timeout => 10);
 
-    return RC_UNKNOWN unless defined($conn);
+    # Resolve network device name into an IPv4/IPv6 address
+    my $devaddr = (is_ipv4($device) || is_ipv6($device)) ? $device:nslookup($device);
+    return RC_UNKNOWN unless(defined($devaddr) && $devaddr ne '');
 
-    # Telnet to remote network device
-    $conn->open($device)
-	or return RC_UNKNOWN;
+    # UNIX socket name will be the IP address of the device
+    my $sockpath = $cf{'sockdir'}."/".$devaddr.".sock";
 
-    print "Connected to remote network device ".$device."\n" if $debug;
+    my ($daemon, $pid);
 
-    # Send username, if defined
-    if(defined($user) && $user ne '') {
-	print "Sending username\n" if $debug;
-	unless($conn->waitfor('/(?:[Uu]ser(?:name)?|[Ll]ogin):/')) {
-	    print "Username failed\n" if $debug;
-	    return RC_UNKNOWN;
+    # Try to connect to the device daemon
+    for(1..$cf{'maxattempts'}) {
+	# Connect to device daemon via UNIX socket
+	$daemon = IO::Socket::UNIX->new(Type => &SOCK_STREAM,
+					Peer => $sockpath,
+					Blocking => 0);
+	# Connection was successful, we are done
+	if(defined($daemon)) {
+	    print "Attached to device ".$device." daemon\n" if $debug;
+	    last;
 	}
-	$conn->put($user."\n");
-    }
-
-    # Send password, if defined
-    if(defined($pass) && $pass ne '') {
-	print "Sending password\n" if $debug;
-	unless($conn->waitfor('/[Pp]ass(?:word)?:/')) {
-	    print "Password failed\n" if $debug;
-	    return RC_UNKNOWN;
+	# If connection failed, assume
+	# that daemon isn't running
+	unless($pid) {
+	    # Start the daemon
+	    $pid = device_daemon($sockpath,
+				 $device,
+				 $type,
+				 $user,
+				 $pass,
+				 $debug,
+				 $cf{'maxidle'});
+	    # Daemon launch failed ?
+	    return RC_UNKNOWN unless defined($pid);
+	    print "Started device ".$device." daemon\n" if $debug;
 	}
-	$conn->cmd($pass);
+	# Wait before retrying
+	sleep(1);
     }
 
-    print "Authenticated to remote network device ".$device."\n" if $debug;
+    return RC_UNKNOWN unless defined($daemon);
 
-    # If device type wasn't specified ...
-    unless(defined($type) && $type ne '') {
-	# ... attempt to detect it
-	$type = detect_device_type($conn);
-	if(defined($type) && $type ne '') {
-	    print "Detected network device type ".$type."\n" if $debug;
+    # Monitor connection to the daemon for incoming data
+    my $select = IO::Select->new();
+    $select->add($daemon);
+
+    my ($stats, $code);
+
+    # Add auth digest to parameters
+    $params{'digest'} = ipc_digest($user, $pass);
+
+    # Send serialized ping parameters to the daemon
+    ipc_write($daemon, \%params);
+
+    print "Sent ping parameters to the daemon\n" if $debug;
+
+    # Read daemon output
+    while(1) {
+	# Wait until daemon sends some data,
+	# or connection closes
+	next unless $select->can_read(0.1);
+	# Get input from daemon
+	my $message = ipc_read($daemon);
+	# If socket was ready, but we got no data,
+	# we got disconnected from the socket
+	last unless $message;
+	# If daemon sent data to be written to stdout ...
+	if(defined($message->{'stdout'})) {
+	    # ... write it to stdout
+	    print STDOUT $message->{'stdout'};
+	}
+	# If daemon sent data to be written to stderr ...
+	if(defined($message->{'stderr'})) {
+	    # ... write it to stderr
+	    print STDERR $message->{'stderr'};
+	}
+	# If daemon sent ping stats ...
+	if(defined($message->{'stats'})) {
+	    # ... keep them
+	    $stats = $message->{'stats'};
+	}
+	# If daemon sent exit code ...
+	if(defined($message->{'code'})) {
+	    # ... keep the code ...
+	    $code = $message->{'code'};
+	    # ... and end the loop
+	    last;
 	}
     }
 
-    my $stats;
+    # Disconnect from the daemon
+    $daemon->close();
 
-    # Determine device-specific ping function
-    my $ping = __PACKAGE__->can('__'.$type.'_ping');
+    # If daemon returned a non-0 exit code,
+    # we will exit with that code
+    return $code if $code;
 
-    # If device type is supported, platform-specific
-    # ping function exists and we have coderef to it
-    if(defined($ping) && ref($ping) eq 'CODE') {
-	# Set telnet cmd (send command, wait for prompt) timeout
-	$conn->timeout($params{'timeout'} * ($params{'packets'} + 1));
-	# Ping the target
-	$stats = $ping->($conn, %params);
-    # If we got no coderef to the ping function ...
-    } else {
-	# ... device type is not supported
-	print "Unsupported device type ".$type."\n" if $debug;
-    }
-
-    # End CLI session
-    $conn->put("exit");
-    # Close telnet session
-    $conn->close;
-
+    # If we got no stats, we cannot do anything
     return RC_UNKNOWN unless defined($stats);
 
-    if($debug) {
-	use Data::Dumper;
-	print Dumper($stats);
-    }
+    print Dumper($stats)."\n" if $debug;
+
+    # We must have at least the number of sent/received packets
+    return RC_UNKNOWN unless(defined($stats->{'received'}) &&
+				     $stats->{'received'} =~ /^\d+(?:\.\d+)?$/ &&
+			     defined($stats->{'sent'}) &&
+				     $stats->{'sent'} =~ /^\d+(?:\.\d+)?$/);
 
     # Calculate packet loss percentage
-    my $packet_loss = int(100 * (1 - ($stats->{'received'} / $stats->{'sent'})));
+    my $packet_loss = sprintf("%.2f", (100 * (1 - ($stats->{'received'} / $stats->{'sent'}))));
 
-    # Check if packet loss exceeds
-    # user-specified critical level
+    # Format average RTT
+    my $rtt_average = (defined($stats->{'rttavg'}) &&
+		       $stats->{'rttavg'} =~ /^\d+(?:\.\d+)?$/) ?
+					sprintf("%.2f", $stats->{'rttavg'}):undef;
+
+    my $rc = RC_OK;
+
+    # Check if packet loss exceeds user-specified critical level
     if($packet_loss >= $crit_pl) {
-	print "PING CRITICAL - Packet loss = ".$packet_loss."%\n";
-	return RC_CRITICAL;
+	$rc = RC_CRITICAL;
+    # Check if RTT average exceeds user-specified critical level
+    } elsif(defined($rtt_average) && $rtt_average >= $crit_rta) {
+	$rc = RC_CRITICAL;
+    # Check if packet loss exceeds user-specified warning level
+    } elsif($packet_loss >= $warn_pl) {
+	$rc = RC_WARNING;
+    # Check if RTT average exceeds user-specified warning level
+    } elsif(defined($rtt_average) && $rtt_average >= $warn_rta) {
+	$rc = RC_WARNING;
     }
 
-    # Check if RTT average exceeds
-    # user-specified critical level
-    if($stats->{'rttavg'} >= $crit_rta) {
-	print "PING CRITICAL - Packet loss = ".$packet_loss."%, RTA = ".$stats->{'rttavg'}." ms\n";
-	return RC_CRITICAL;
-    }
+    my %rc_str = (
+	&RC_OK		=> "OK",
+	&RC_WARNING	=> "WARNING",
+	&RC_CRITICAL	=> "CRITICAL"
+    );
 
-    # Check if packet loss exceeds
-    # user-specified warning level
-    if($packet_loss >= $warn_pl) {
-	print "PING WARNING - Packet loss = ".$packet_loss."%\n";
-	return RC_WARNING;
-    }
+    print "PING ".$rc_str{$rc}." - Packet loss = ".$packet_loss."%";
+    print ", RTA = ".$rtt_average." ms" if defined($rtt_average);
+    print "\n";
 
-    # Check if RTT average exceeds
-    # user-specified warning level
-    if($stats->{'rttavg'} >= $warn_rta) {
-	print "PING WARNING - Packet loss = ".$packet_loss."%, RTA = ".$stats->{'rttavg'}." ms\n";
-	return RC_WARNING;
-    }
-
-    print "PING OK - Packet loss = ".$packet_loss."%, RTA = ".$stats->{'rttavg'}." ms\n";
-    return RC_OK;
+    return $rc;
 }
 
 #########################################################################
 ##                  C I S C O   I O S   D E V I C E                    ##
 #########################################################################
 
-sub __ios_ping($;%)
+sub __ios_ping($$;%)
 {
+    my $frontend = shift;
     my $conn = shift;
 
     # Get ping parameters
@@ -388,9 +813,9 @@ sub __ios_ping($;%)
 
     # Change to enable mode, if defined
     if(defined($enable) && $enable ne '') {
-	print "Sending enable password\n" if $debug;
+	print_stdout($frontend, "Sending enable password\n") if $debug;
 	unless($conn->cmd(String => "enable\n".$enable, Timeout => 10)) {
-	    print "Enable failed\n" if $debug;
+	    print_stderr($frontend, "Enable failed\n") if $debug;
 	    return undef;
 	}
     }
@@ -431,7 +856,7 @@ sub __ios_ping($;%)
     }
 
     # Display debugging if requested
-    print "Executing ".$cmd."\n" if $debug;
+    print_stdout($frontend, "Executing ".$cmd."\n") if $debug;
 
     # Issue ping command and get the command's output
     my @output = $conn->cmd($cmd);
@@ -443,7 +868,7 @@ sub __ios_ping($;%)
     chomp $summary;
     return undef unless $summary ne '';
 
-    print $summary."\n" if $debug;
+    print_stdout($frontend, $summary."\n") if $debug;
 
     my %result;
 
@@ -457,8 +882,9 @@ sub __ios_ping($;%)
 ##              C I S C O   I O S   X R   D E V I C E                  ##
 #########################################################################
 
-sub __iosxr_ping($;%)
+sub __iosxr_ping($$;%)
 {
+    my $frontend = shift;
     my $conn = shift;
 
     # Get ping parameters
@@ -499,7 +925,7 @@ sub __iosxr_ping($;%)
     }
 
     # Display debugging if requested
-    print "Executing ".$cmd."\n" if $debug;
+    print_stdout($frontend, "Executing ".$cmd."\n") if $debug;
 
     # Issue ping command and get the command's output
     my @output = $conn->cmd($cmd);
@@ -511,7 +937,7 @@ sub __iosxr_ping($;%)
     chomp $summary;
     return undef unless $summary ne '';
 
-    print $summary."\n" if $debug;
+    print_stdout($frontend, $summary."\n") if $debug;
 
     my %result;
 
@@ -525,8 +951,9 @@ sub __iosxr_ping($;%)
 ##                    F O R C E 1 0   D E V I C E                      ##
 #########################################################################
 
-sub __force10_ping($;%)
+sub __force10_ping($$;%)
 {
+    my $frontend = shift;
     my $conn = shift;
 
     # Get ping parameters
@@ -555,7 +982,7 @@ sub __force10_ping($;%)
     }
 
     # Display debugging if requested
-    print "Executing ".$cmd."\n" if $debug;
+    print_stdout($frontend, "Executing ".$cmd."\n") if $debug;
 
     # Issue ping command and get the command's output
     my @output = $conn->cmd($cmd);
@@ -567,7 +994,7 @@ sub __force10_ping($;%)
     chomp $summary;
     return undef unless $summary ne '';
 
-    print $summary."\n" if $debug;
+    print_stdout($frontend, $summary."\n") if $debug;
 
     my %result;
 
@@ -581,8 +1008,9 @@ sub __force10_ping($;%)
 ##          D E L L   P O W E R C O N N E C T   D E V I C E            ##
 #########################################################################
 
-sub __powerconnect_ping(%)
+sub __powerconnect_ping($$;%)
 {
+    my $frontend = shift;
     my $conn = shift;
 
     # Get ping parameters
@@ -614,38 +1042,24 @@ sub __powerconnect_ping(%)
     }
 
     # Display debugging if requested
-    print "Executing ".$cmd."\n" if $debug;
+    print_stdout($frontend, "Executing ".$cmd."\n") if $debug;
 
     # Issue ping command and get the command's output
     my @output = $conn->cmd($cmd);
 
-    my %result;
+    my %result = ();
 
-    pop @output;
-
-    # RTT statistics
-    my $rtt_summary = pop @output;
-    return undef unless defined($rtt_summary);
-
-    chomp $rtt_summary;
-    return undef unless $rtt_summary ne '';
-
-    print $rtt_summary."\n" if $debug;
-
-    # Extract summary information
-    @result{('rttmin', 'rttavg', 'rttmax')} = ($rtt_summary =~ /^round\-trip \(msec\) min\/avg\/max = (\d+)\/(\d+)\/(\d+)$/i);
-
-    # Packet loss statistics
-    my $pl_summary = pop @output;
-    return undef unless defined($pl_summary);
-
-    chomp $pl_summary;
-    return undef unless $pl_summary ne '';
-
-    print $pl_summary."\n" if $debug;
-
-    # Extract summary information
-    @result{('sent','received')} = ($pl_summary =~ /^(\d+) packets transmitted, (\d+) packets received, \d+(\.\d+)?% packet loss$/i);
+    while((my $line = pop @output)) {
+	if($line =~ /^round\-trip \(msec\) min\/avg\/max = (\d+)\/(\d+)\/(\d+)$/i) {
+	    @result{('rttmin', 'rttavg', 'rttmax')} = ($1, $2, $3);
+	} elsif($line =~ /^(\d+) packets transmitted, (\d+) packets received, \d+(\.\d+)?% packet loss$/i) {
+	    @result{('sent','received')} = ($1, $2);
+	    @output = ();
+	} else {
+	    next;
+	}
+	print_stdout($frontend, $line) if $debug;
+    }
 
     return \%result;
 }
@@ -654,8 +1068,9 @@ sub __powerconnect_ping(%)
 ##                      J U N O S   D E V I C E                        ##
 #########################################################################
 
-sub __junos_ping(%)
+sub __junos_ping($$;%)
 {
+    my $frontend = shift;
     my $conn = shift;
 
     # Get ping parameters
@@ -699,40 +1114,24 @@ sub __junos_ping(%)
     }
 
     # Display debugging if requested
-    print "Executing ".$cmd."\n" if $debug;
+    print_stdout($frontend, "Executing ".$cmd."\n") if $debug;
 
     # Issue ping command and get the command's output
     my @output = $conn->cmd($cmd);
 
-    my %result;
+    my %result = ();
 
-    # Skip to summary
-    my $last_line = pop @output;
-    pop @output if(defined($last_line) && $last_line !~ /^$/);
-
-    # RTT statistics
-    my $rtt_summary = pop @output;
-    return undef unless defined($rtt_summary);
-
-    chomp $rtt_summary;
-    return undef unless $rtt_summary ne '';
-
-    print $rtt_summary."\n" if $debug;
-
-    # Extract summary information
-    @result{('rttmin', 'rttavg', 'rttmax')} = ($rtt_summary =~ /^round-trip min\/avg\/max\/std\-?dev = (\d+(?:\.\d+)?)\/(\d+(?:\.\d+)?)\/(\d+(?:\.\d+)?)\/\d+(?:\.\d+)? ms$/i);
-
-    # Packet loss statistics
-    my $pl_summary = pop @output;
-    return undef unless defined($pl_summary);
-
-    chomp $pl_summary;
-    return undef unless $pl_summary ne '';
-
-    print $pl_summary."\n" if $debug;
-
-    # Extract summary information
-    @result{('sent','received')} = ($pl_summary =~ /^(\d+) packets transmitted, (\d+) packets received, \d+(\.\d+)?% packet loss$/i);
+    while((my $line = pop @output)) {
+	if($line =~ /^round-trip min\/avg\/max\/std\-?dev = (\d+(?:\.\d+)?)\/(\d+(?:\.\d+)?)\/(\d+(?:\.\d+)?)\/\d+(?:\.\d+)? ms$/i) {
+	    @result{('rttmin', 'rttavg', 'rttmax')} = ($1, $2, $3);
+	} elsif($line =~ /^(\d+) packets transmitted, (\d+) packets received, \d+(\.\d+)?% packet loss$/i) {
+	    @result{('sent','received')} = ($1, $2);
+	    @output = ();
+	} else {
+	    next;
+	}
+	print_stdout($frontend, $line) if $debug;
+    }
 
     return \%result;
 }
