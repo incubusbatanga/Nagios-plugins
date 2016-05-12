@@ -405,11 +405,16 @@ l:  while(time() < $idle_timeout) {
 	    # If socket was ready, but we got no params,
 	    # frontend disconnected from the socket
 	    unless(defined($params)) {
-		print_stderr($socket, "Got no parameters for device ".$device."\n") if $debug;
 		return_code($socket, RC_UNKNOWN);
 		$select->remove($socket);
 		$socket->close();
 		next;
+	    }
+
+	    # If params contain debug flag (and they should) ...
+	    if(defined($params->{'debug'})) {
+		# ... replace daemon's current debug setting
+		$debug = $params->{'debug'};
 	    }
 
 	    # Parameters must be 'signed' with MD5 digest
