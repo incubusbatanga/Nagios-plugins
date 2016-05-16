@@ -1,4 +1,4 @@
-#!/usr/bin/perl -w
+#!/usr/bin/perl
 
 #########################################################################
 
@@ -22,14 +22,13 @@
 #########################################################################
 
 our (%PARAMS, %CONFIG, %PARAMS_DEFAULTS, %CONFIG_DEFAULTS);
-our ($PROGRAM, $VERSION);
-our $USAGE;
+our ($PROGRAM, $VERSION, $USAGE);
 
 #########################################################################
 
 ($PROGRAM) = ($0 =~ /([^\/]+)$/);
 
-$VERSION = "0.2";
+$VERSION = "0.3";
 
 #########################################################################
 ##      O P T I O N A L   S T A T I C   C O N F I G U R A T I O N      ##
@@ -353,81 +352,120 @@ sub device_daemon($$;$$$$$)
 
     # Daemon process starts here
     my ($sockpath, $device, $type, $user, $pass, $debug, $maxidle) = @_;
-    my ($conn, $detected, $ping);
+    my ($func_ping, $func_parse);
+    my ($conn, $detected);
 
     # Initial daemon process's title
-    my $proctitle = $PROGRAM." daemon";
+    my $baseproctitle = $PROGRAM." daemon";
+    my $proctitle = $baseproctitle;
     $0 = $proctitle;
 
-    # Remove stale socket if present
+    # Disable common signals that
+    # could terminate the daemon
+    $SIG{'PIPE'} =
+    $SIG{'TERM'} =
+    $SIG{'INT'} =
+    $SIG{'HUP'} = 'IGNORE';
+
+    # Remove stale UNIX socket if present
     if(-S $sockpath) {
 	unlink($sockpath);
     }
 
-    # UNIX socket to talk to our frontend
+    # Create new UNIX socket to talk to our frontend
     my $listener = IO::Socket::UNIX->new(Type => &SOCK_STREAM,
 					 Local => $sockpath,
-					 Listen => 1,
+					 Listen => &SOMAXCONN,
 					 Blocking => 0);
 
     exit(RC_UNKNOWN) unless defined($listener);
 
-    # Monitor listener socket
+    # Monitor listener socket for incoming connections
     my $select = IO::Select->new();
     $select->add($listener);
 
     my $idle_timeout = time() + $maxidle;
+    my $cmd_timeout;
 
-l:  while(time() < $idle_timeout) {
+    my @requests = ();
+    my $frontend;
+    my $params;
 
-	$0 = $proctitle.", idle shutdown in ".($idle_timeout - time())." sec";
+    # Main loop will run as long as
+    # daemon is not idle for more
+    # than specified maxidle time
+    while((my $idle_remaining = $idle_timeout - time()) > 0) {
+
+	if($idle_remaining < $maxidle) {
+	    $0 = $proctitle.", idle shutdown in ".$idle_remaining." sec";
+	}
 
 	# Wait until listening socket is ready
 	my @ready = $select->can_read(0.1);
-	next unless @ready;
-
+	# Pick up and handle ready sockets
 	foreach my $socket (@ready) {
-
 	    # If ready socket is the listening socket ...
 	    if($socket == $listener) {
 		# ... we have incoming connection
-		my $frontend = $socket->accept();
-		# Make frontend connection non-blocking
-		$frontend->blocking(0);
-		# Add frontend connection to the monitor
-		$select->add($frontend);
-		next;
+		my $incoming = $socket->accept();
+		# Make new connection non-blocking
+		$incoming->blocking(0);
+		# Start monitoring it for input
+		$select->add($incoming);
+	    # If ready socket is the active frontend ...
+	    } elsif(defined($frontend) && 
+		    $socket == $frontend) {
+		# ... we are not expecting more input
+		# from the frontend, so we will assume
+		# this was the socket closing event.
+		# Force the ping in progress to timeout
+		# immediately
+		$cmd_timeout = 0;
+	    # If ready socket is a newly accepted
+	    # connection from a frontend ...
+	    } else {
+		# ... get ping parameters
+		my $params = ipc_read($socket);
+		# If socket was ready, but we got no params,
+		# frontend disconnected prematurely or sent
+		# junk that we couldn't handle
+		unless(defined($params)) {
+		    $select->remove($socket);
+		    $socket->close();
+		    next;
+		}
+		# Keep socket to the frontend
+		# with other ping parameters
+		$params->{'frontend'} = $socket;
+		# Queue received parameters
+		push @requests, $params;
 	    }
+	}
 
-	    # Get ping parameters from our frontend
-	    my $params = ipc_read($socket);
-
-	    # If socket was ready, but we got no params,
-	    # frontend disconnected from the socket
-	    unless(defined($params)) {
-		return_code($socket, RC_UNKNOWN);
-		$select->remove($socket);
-		$socket->close();
-		next;
-	    }
-
-	    # If params contain debug flag (and they should) ...
+	# If we are idle ...
+	unless(defined($frontend)) {
+	    # ... take the next request
+	    $params = shift @requests;
+	    next unless defined($params);
+	    # Requesting frontend's UNIX socket
+	    my $socket = $params->{'frontend'};
+	    # If params contain debug flag (as they should) ...
 	    if(defined($params->{'debug'})) {
 		# ... replace daemon's current debug setting
 		$debug = $params->{'debug'};
 	    }
-
 	    # Parameters must be 'signed' with MD5 digest
 	    # formatted from device's login credentials.
-	    # This ensures the frontend is invoked with
-	    # proper device credentials while daemon is
-	    # running. Otherwise, device credentials
-	    # would be required only to allow daemon to
-	    # initially authenticate to the remote device,
-	    # but since the session is established from
-	    # that point on, subsequent frontend runs
-	    # would simply land in the middle of already
-	    # established CLI session without auth.
+	    # This ensures that the frontend is invoked
+	    # with proper device credentials while daemon
+	    # is running. Otherwise, device credentials
+	    # would be required only the first time, to
+	    # allow daemon to initially authenticate to
+	    # the remote device, but since the session
+	    # will be in the established state from that
+	    # point on, subsequent frontend runs would
+	    # land in the middle of already established
+	    # CLI session without auth.
 	    unless($params->{'digest'} eq ipc_digest($user, $pass)) {
 		print_stderr($socket, "Invalid credentials for device ".$device."\n") if $debug;
 		return_code($socket, RC_UNKNOWN);
@@ -435,7 +473,6 @@ l:  while(time() < $idle_timeout) {
 		$socket->close();
 		next;
 	    }
-
 	    # If not connected to the device yet ...
 	    unless(defined($conn)) {
 		# ... attempt to connect now
@@ -445,7 +482,7 @@ l:  while(time() < $idle_timeout) {
 		    return_code($socket, RC_UNKNOWN);
 		    $select->remove($socket);
 		    $socket->close();
-		    last l;
+		    last;
 		}
 		# If device type wasn't specified ...
 		unless(defined($type) && $type ne '') {
@@ -455,52 +492,123 @@ l:  while(time() < $idle_timeout) {
 		    if(defined($detected) && $detected ne '') {
 			print_stdout($socket, "Detected network device type ".$detected."\n") if $debug;
 			# ... force device-specific ping function lookup
-			undef $ping;
+			undef $func_ping;
+			undef $func_parse;
 		    }
 		}
-		# Set telnet cmd (send command, wait for prompt) timeout
-		$conn->timeout($params->{'timeout'} * ($params->{'packets'} + 1));
 		# Set daemon proctitle to reflect connected state
-		$proctitle .= " connected to ".$device;
+		$proctitle = $baseproctitle." connected to ".$device;
 		$0 = $proctitle;
 	    }
-
-	    # If device-specific ping function isn't known ...
-	    unless(defined($ping) && ref($ping) eq 'CODE') {
+	    # If device-specific functions aren't known ...
+	    unless(defined($func_ping) && ref($func_ping) eq 'CODE' &&
+		   defined($func_parse) && ref($func_parse) eq 'CODE') {
+		# Explicitly defined device type overrides autodetected one
 		my $device_type = (defined($type) && $type ne '') ? $type:$detected;
-		# Determine device-specific ping function
-		$ping = __PACKAGE__->can('__'.$device_type.'_ping');
+		# Determine mandatory device-specific functions
+		$func_ping = __PACKAGE__->can('__'.$device_type.'_ping');
+		$func_parse = __PACKAGE__->can('__'.$device_type.'_parse');
 		# If device type is supported, platform-specific
-		# ping function exists and we have coderef to it
-		unless(defined($ping) && ref($ping) eq 'CODE') {
+		# ping functions exist and we have coderef to them
+		unless(defined($func_ping) && ref($func_ping) eq 'CODE' &&
+		       defined($func_parse) && ref($func_parse) eq 'CODE') {
 		    # Otherwise, this device type is not supported
 		    print_stderr($socket, "Unsupported device type ".$type."\n") if $debug;
 		    return_code($socket, RC_UNKNOWN);
 		    $select->remove($socket);
 		    $socket->close();
-		    last l;
+		    last;
 		}
+	    }
+
+	    # Set telnet cmd (send command, wait for prompt) timeout
+	    $cmd_timeout = $params->{'timeout'} * ($params->{'packets'} + 1);
+	    $conn->timeout($cmd_timeout);
+	    $cmd_timeout += time();
+
+	    # Start pinging the target
+	    if($func_ping->($conn, %{$params})) {
+		# Keep active frontend's socket
+		# until request has been completed
+		$frontend = $socket;
+		# Set proctitle to reflect
+		# daemon's current operation
+		$0 = $proctitle.", pinging ".$params->{'target'};
+		$0 .= " inside VRF ".$params->{'vrf'} if(defined($params->{'vrf'}) &&
+							 $params->{'vrf'} ne '');
+	    # If ping command failed ...
+	    } else {
+		# ... report error
+		print_stderr($socket, "Command failed\n") if $debug;
+		return_code($socket, RC_UNKNOWN);
+		# Also ...
+		if(defined($conn)) {
+		    # ... close the connection in case
+		    # command failed because something
+		    # messed up the CLI session
+		    $conn->close();
+		    # Force daemon to reconnect
+		    undef $conn;
+		    # Change proctitle to reflect our disconnected state
+		    $proctitle = $baseproctitle;
+		}
+		# ... stop monitoring socket for events
+		$select->remove($socket);
+		# ... and disconnect the frontend
+		$socket->close();
 	    }
 
 	    # Reset idle timeout
 	    $idle_timeout = time() + $maxidle;
 
-	    # Ping the target
-	    my $stats = $ping->($socket, $conn, %{$params});
+	}
 
-	    # If we received ping statistics ...
-	    if(defined($stats)) {
-		# ... send them to the frontend
-		return_stats($socket, $stats);
-	    # Otherwise ...
-	    } else{
-		# ... return generic error code
-		return_code($socket, RC_UNKNOWN);
+	# Ping in progress ?
+	if(defined($frontend)) {
+	    # Check if ping command finished
+	    my ($output) = $conn->waitfor(Match => '/'.CLI_PROMPT.'/', Timeout => 1);
+	    # If we got output, command has finished
+	    if(defined($output) && $output ne '') {
+		# Split command output into separate lines
+		my @results = split(/[\n\r]/, $output);
+		# Parse command output
+		my $stats = $func_parse->($conn, \@results, %{$params});
+		# If we received ping statistics ...
+		if(defined($stats)) {
+		    # ... send them to the frontend
+		    return_stats($frontend, $stats);
+		# Otherwise ...
+		} else{
+		    # ... return generic error code
+		    return_code($frontend, RC_UNKNOWN);
+		}
+	    # If we got no output, ping is still in progress
+	    } else {
+		# Reset idle timeout
+		$idle_timeout = time() + $maxidle;
+		# Keep waiting until command finishes or times out
+		next if(time() < $cmd_timeout);
+		# On timeout, return error message and code
+		print_stderr($frontend, "Command failed\n") if $debug;
+		return_code($frontend, RC_UNKNOWN);
+		# If command was aborted or timed out ...
+		if(defined($conn)) {
+		    # ... close the connection in case
+		    # something messed up CLI session
+		    $conn->close();
+		    # Force daemon to reconnect
+		    undef $conn;
+		    # Change proctitle to reflect our disconnected state
+		    $proctitle = $baseproctitle;
+		}
 	    }
-
+	    # Stop monitoring socket for events
+	    $select->remove($frontend);
 	    # Disconnect the frontend
-	    $select->remove($socket);
-	    $socket->close();
+	    $frontend->close();
+	    # Make us idle again
+	    undef $frontend;
+	    undef $params;
 	}
 
     }
@@ -656,7 +764,6 @@ sub main()
 				$crit_pl =~ /^\d+$/ &&
 				$crit_pl >= 0);
 
-
     # Resolve network device name into an IPv4/IPv6 address
     my $devaddr = (is_ipv4($device) || is_ipv6($device)) ? $device:nslookup($device);
     return RC_UNKNOWN unless(defined($devaddr) && $devaddr ne '');
@@ -702,7 +809,10 @@ sub main()
     my $select = IO::Select->new();
     $select->add($daemon);
 
-    my ($stats, $code);
+    my $run = 1;
+
+    $SIG{'TERM'} = $SIG{'INT'} = sub { $run = 0; };
+    $SIG{'PIPE'} = $SIG{'HUP'} = 'IGNORE';
 
     # Add auth digest to parameters
     $params{'digest'} = ipc_digest($user, $pass);
@@ -712,8 +822,10 @@ sub main()
 
     print "Sent ping parameters to the daemon\n" if $debug;
 
+    my ($stats, $code);
+
     # Read daemon output
-    while(1) {
+    while($run) {
 	# Wait until daemon sends some data,
 	# or connection closes
 	next unless $select->can_read(0.1);
@@ -756,7 +868,10 @@ sub main()
     # If we got no stats, we cannot do anything
     return RC_UNKNOWN unless defined($stats);
 
-    print Dumper($stats)."\n" if $debug;
+    if($debug) {
+	$Data::Dumper::Terse = 1;
+	print "Ping stats: ".Dumper($stats)."\n";
+    }
 
     # We must have at least the number of sent/received packets
     return RC_UNKNOWN unless(defined($stats->{'received'}) &&
@@ -805,23 +920,24 @@ sub main()
 ##                  C I S C O   I O S   D E V I C E                    ##
 #########################################################################
 
-sub __ios_ping($$;%)
+sub __ios_ping($;%)
 {
-    my $frontend = shift;
     my $conn = shift;
 
     # Get ping parameters
-    my ($enable, $target, $af, $source, $packets, $size, $timeout, $vrf, $debug) =
-	@{{@_}}{('enable', 'target', 'af', 'source', 'packets', 'size', 'timeout', 'vrf', 'debug')};
+    my ($frontend, $enable, $target, $af, $source, $packets, $size, $timeout, $vrf, $debug) =
+	@{{@_}}{('frontend', 'enable', 'target', 'af', 'source', 'packets', 'size', 'timeout', 'vrf', 'debug')};
 
-    return undef unless(defined($target) && $target ne '');
+    return 0 unless(defined($target) && $target ne '');
 
     # Change to enable mode, if defined
     if(defined($enable) && $enable ne '') {
 	print_stdout($frontend, "Sending enable password\n") if $debug;
-	unless($conn->cmd(String => "enable\n".$enable, Timeout => 10)) {
+	$conn->cmd(String => "enable", Prompt => '/[Pp]assword:/', Timeout => 1);
+	unless($conn->cmd(String => $enable, Prompt => '/#$/', Timeout => 1)) {
+	    $conn->cmd("\n\n");
 	    print_stderr($frontend, "Enable failed\n") if $debug;
-	    return undef;
+	    return 0;
 	}
     }
 
@@ -859,23 +975,38 @@ sub __ios_ping($$;%)
 	    $cmd .= " timeout ".$timeout;
 	}
     }
+    $cmd .= "\n";
 
     # Display debugging if requested
-    print_stdout($frontend, "Executing ".$cmd."\n") if $debug;
+    print_stdout($frontend, "Executing ".$cmd) if $debug;
 
     # Issue ping command and get the command's output
-    my @output = $conn->cmd($cmd);
+    $conn->put($cmd);
+
+    return 1;
+}
+
+sub __ios_parse($$;%)
+{
+    my $conn = shift;
+    my $output = shift;
+
+    # Get ping parameters
+    my ($frontend, $debug) = @{{@_}}{('frontend', 'debug')};
+
+    my %result;
+
+    # Exit privileged mode, if there was one
+    $conn->cmd(String => "disable", Timeout => 1);
 
     # The last line of output contains the ping summary
-    my $summary = pop @output;
+    my $summary = pop @{$output};
     return undef unless defined($summary);
 
     chomp $summary;
     return undef unless $summary ne '';
 
     print_stdout($frontend, $summary."\n") if $debug;
-
-    my %result;
 
     # Extract summary information
     @result{('received', 'sent', 'rttmin', 'rttavg', 'rttmax')} = ($summary =~ /^Success rate is \d+ percent \((\d+)\/(\d+)\)(?:, round\-trip min\/avg\/max = (\d+)\/(\d+)\/(\d+) ms)?$/i);
@@ -887,16 +1018,15 @@ sub __ios_ping($$;%)
 ##              C I S C O   I O S   X R   D E V I C E                  ##
 #########################################################################
 
-sub __iosxr_ping($$;%)
+sub __iosxr_ping($;%)
 {
-    my $frontend = shift;
     my $conn = shift;
 
     # Get ping parameters
-    my ($target, $af, $source, $packets, $size, $timeout, $vrf, $debug) =
-	@{{@_}}{('target', 'af', 'source', 'packets', 'size', 'timeout', 'vrf', 'debug')};
+    my ($frontend, $target, $af, $source, $packets, $size, $timeout, $vrf, $debug) =
+	@{{@_}}{('frontend', 'target', 'af', 'source', 'packets', 'size', 'timeout', 'vrf', 'debug')};
 
-    return undef unless(defined($target) && $target ne '');
+    return 0 unless(defined($target) && $target ne '');
 
     # Format ping command
     my $cmd = "ping";
@@ -928,23 +1058,34 @@ sub __iosxr_ping($$;%)
     if(defined($timeout) && $timeout ne '') {
 	$cmd .= " timeout ".$timeout;
     }
+    $cmd .= "\n";
 
     # Display debugging if requested
-    print_stdout($frontend, "Executing ".$cmd."\n") if $debug;
+    print_stdout($frontend, "Executing ".$cmd) if $debug;
 
-    # Issue ping command and get the command's output
-    my @output = $conn->cmd($cmd);
+    # Issue ping command
+    $conn->put($cmd);
+
+    return 1;
+}
+
+sub __iosxr_parse($$;%)
+{
+    my $conn = shift;
+    my $output = shift;
+
+    # Get ping parameters
+    my ($frontend, $debug) = @{{@_}}{('frontend', 'debug')};
+    my %result;
 
     # The last line of output contains the ping summary
-    my $summary = pop @output;
+    my $summary = pop @{$output};
     return undef unless defined($summary);
 
     chomp $summary;
     return undef unless $summary ne '';
 
     print_stdout($frontend, $summary."\n") if $debug;
-
-    my %result;
 
     # Extract summary information
     @result{('received', 'sent', 'rttmin', 'rttavg', 'rttmax')} = ($summary =~ /^Success rate is \d+ percent \((\d+)\/(\d+)\)(?:, round\-trip min\/avg\/max = (\d+)\/(\d+)\/(\d+) ms)?$/i);
@@ -956,16 +1097,15 @@ sub __iosxr_ping($$;%)
 ##                    F O R C E 1 0   D E V I C E                      ##
 #########################################################################
 
-sub __force10_ping($$;%)
+sub __force10_ping($;%)
 {
-    my $frontend = shift;
     my $conn = shift;
 
     # Get ping parameters
-    my ($target, $source, $packets, $size, $timeout, $debug) =
-	@{{@_}}{('target', 'source', 'packets', 'size', 'timeout', 'debug')};
+    my ($frontend, $target, $source, $packets, $size, $timeout, $debug) =
+	@{{@_}}{('frontend', 'target', 'source', 'packets', 'size', 'timeout', 'debug')};
 
-    return undef unless(defined($target) && $target ne '');
+    return 0 unless(defined($target) && $target ne '');
 
     # Format ping command
     my $cmd = "ping ".$target;
@@ -985,23 +1125,34 @@ sub __force10_ping($$;%)
     if(defined($timeout) && $timeout ne '') {
 	$cmd .= " timeout ".$timeout;
     }
+    $cmd .= "\n";
 
     # Display debugging if requested
-    print_stdout($frontend, "Executing ".$cmd."\n") if $debug;
+    print_stdout($frontend, "Executing ".$cmd) if $debug;
 
-    # Issue ping command and get the command's output
-    my @output = $conn->cmd($cmd);
+    # Issue ping command
+    $conn->put($cmd);
+
+    return 1;
+}
+
+sub __force10_parse($$;%)
+{
+    my $conn = shift;
+    my $output = shift;
+
+    # Get ping parameters
+    my ($frontend, $debug) = @{{@_}}{('frontend', 'debug')};
+    my %result;
 
     # The last line of output contains the ping summary
-    my $summary = pop @output;
+    my $summary = pop @{$output};
     return undef unless defined($summary);
 
     chomp $summary;
     return undef unless $summary ne '';
 
     print_stdout($frontend, $summary."\n") if $debug;
-
-    my %result;
 
     # Extract summary information
     @result{('received', 'sent', 'rttmin', 'rttavg', 'rttmax')} = ($summary =~ /^Success rate is \d+(?:\.\d+)? percent \((\d+)\/(\d+)\)(?:, round\-trip min\/avg\/max = (\d+)\/(\d+)\/(\d+) \(ms\))?$/i);
@@ -1013,16 +1164,15 @@ sub __force10_ping($$;%)
 ##          D E L L   P O W E R C O N N E C T   D E V I C E            ##
 #########################################################################
 
-sub __powerconnect_ping($$;%)
+sub __powerconnect_ping($;%)
 {
-    my $frontend = shift;
     my $conn = shift;
 
     # Get ping parameters
-    my ($target, $af, $packets, $size, $timeout, $debug) =
-	@{{@_}}{('target', 'af', 'packets', 'size', 'timeout', 'debug')};
+    my ($frontend, $target, $af, $packets, $size, $timeout, $debug) =
+	@{{@_}}{('frontend', 'target', 'af', 'packets', 'size', 'timeout', 'debug')};
 
-    return undef unless(defined($target) && $target ne '');
+    return 0 unless(defined($target) && $target ne '');
 
     # Format ping command
     my $cmd = "ping";
@@ -1045,21 +1195,32 @@ sub __powerconnect_ping($$;%)
     } elsif(defined($timeout) && $timeout ne '') {
 	$cmd .= " timeout ".$timeout;
     }
+    $cmd .= "\n";
 
     # Display debugging if requested
-    print_stdout($frontend, "Executing ".$cmd."\n") if $debug;
+    print_stdout($frontend, "Executing ".$cmd) if $debug;
 
-    # Issue ping command and get the command's output
-    my @output = $conn->cmd($cmd);
+    # Issue ping command
+    $conn->put($cmd);
 
-    my %result = ();
+    return 1;
+}
 
-    while((my $line = pop @output)) {
+sub __powerconnect_parse($$;%)
+{
+    my $conn = shift;
+    my $output = shift;
+
+    # Get ping parameters
+    my ($frontend, $debug) = @{{@_}}{('frontend', 'debug')};
+    my %result;
+
+    while(defined(my $line = pop @{$output})) {
 	if($line =~ /^round\-trip \(msec\) min\/avg\/max = (\d+)\/(\d+)\/(\d+)$/i) {
 	    @result{('rttmin', 'rttavg', 'rttmax')} = ($1, $2, $3);
 	} elsif($line =~ /^(\d+) packets transmitted, (\d+) packets received, \d+(\.\d+)?% packet loss$/i) {
 	    @result{('sent','received')} = ($1, $2);
-	    @output = ();
+	    $output = [];
 	} else {
 	    next;
 	}
@@ -1073,16 +1234,15 @@ sub __powerconnect_ping($$;%)
 ##                      J U N O S   D E V I C E                        ##
 #########################################################################
 
-sub __junos_ping($$;%)
+sub __junos_ping($;%)
 {
-    my $frontend = shift;
     my $conn = shift;
 
     # Get ping parameters
-    my ($target, $af, $source, $packets, $size, $timeout, $vrf, $debug) =
-	@{{@_}}{('target', 'af', 'source', 'packets', 'size', 'timeout', 'vrf', 'debug')};
+    my ($frontend, $target, $af, $source, $packets, $size, $timeout, $vrf, $debug) =
+	@{{@_}}{('frontend', 'target', 'af', 'source', 'packets', 'size', 'timeout', 'vrf', 'debug')};
 
-    return undef unless(defined($target) && $target ne '');
+    return 0 unless(defined($target) && $target ne '');
 
     # We must explicitly set screen width to maximum.
     # Otherwise, commands we issue will be truncated
@@ -1117,25 +1277,37 @@ sub __junos_ping($$;%)
     if(defined($timeout) && $timeout ne '') {
 	$cmd .= " interval ".$timeout;
     }
+    $cmd .= "\n";
 
     # Display debugging if requested
-    print_stdout($frontend, "Executing ".$cmd."\n") if $debug;
+    print_stdout($frontend, "Executing ".$cmd) if $debug;
 
-    # Issue ping command and get the command's output
-    my @output = $conn->cmd($cmd);
+    # Issue ping command 
+    $conn->put($cmd);
 
-    my %result = ();
+    return 1;
+}
 
-    while((my $line = pop @output)) {
+sub __junos_parse($$;$)
+{
+    my $conn = shift;
+    my $output = shift;
+
+    # Get ping parameters
+    my ($frontend, $debug) = @{{@_}}{('frontend', 'debug')};
+
+    my %result;
+
+    while(defined(my $line = pop @{$output})) {
 	if($line =~ /^round-trip min\/avg\/max\/std\-?dev = (\d+(?:\.\d+)?)\/(\d+(?:\.\d+)?)\/(\d+(?:\.\d+)?)\/\d+(?:\.\d+)? ms$/i) {
 	    @result{('rttmin', 'rttavg', 'rttmax')} = ($1, $2, $3);
 	} elsif($line =~ /^(\d+) packets transmitted, (\d+) packets received, \d+(\.\d+)?% packet loss$/i) {
 	    @result{('sent','received')} = ($1, $2);
-	    @output = ();
+	    $output = [];
 	} else {
 	    next;
 	}
-	print_stdout($frontend, $line) if $debug;
+	print_stdout($frontend, $line."\n") if $debug;
     }
 
     return \%result;
