@@ -1288,7 +1288,7 @@ sub __junos_ping($;%)
     return 1;
 }
 
-sub __junos_parse($$;$)
+sub __junos_parse($$;%)
 {
     my $conn = shift;
     my $output = shift;
