@@ -365,7 +365,7 @@ sub device_daemon($$;$$$$$)
     close(STDOUT);
     close(STDERR);
 
-    # Create process to new session
+    # Move process to the new session
     setsid();
 
     # Disable common signals that
