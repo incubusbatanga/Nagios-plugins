@@ -1,5 +1,5 @@
 #!/usr/bin/perl
-
+# nagios: -epn
 #########################################################################
 
 #
@@ -79,14 +79,16 @@ use warnings;
 
 #########################################################################
 
-use Net::Telnet;
-
 use Getopt::Std;
+
+use POSIX qw(setsid);
 
 use Digest::MD5 qw(md5_base64);
 use IO::Select;
 use IO::Socket::UNIX;
 use Storable qw(nstore_fd fd_retrieve);
+
+use Net::Telnet;
 
 use Data::Dumper;
 
@@ -273,17 +275,17 @@ sub return_stats($$)
 
 sub detect_device_type($)
 {
-    my $conn = shift;
+    my $cli = shift;
 
     # Request system version. Most platforms support this command
-    $conn->put("show version\n");
+    $cli->put("show version\n");
     # Collect output up to command prompt or pagination marker
-    my ($version, $prompt) = $conn->waitfor('/(?:'.PAGE_MARKER.'|'.CLI_PROMPT.')/i');
+    my ($version, $prompt) = $cli->waitfor('/(?:'.PAGE_MARKER.'|'.CLI_PROMPT.')/i');
     # If output is paginated ...
     if(defined($prompt) && $prompt =~ /@{[PAGE_MARKER]}/i) {
 	# ... end pagination
-	$conn->put("q");
-	$conn->waitfor('/'.CLI_PROMPT.'/');
+	$cli->put("q");
+	$cli->waitfor('/'.CLI_PROMPT.'/');
     }
 
     # If version info is available, attempt platform detection
@@ -303,14 +305,14 @@ sub device_connect($$$$;$)
     my ($frontend, $device, $user, $pass, $debug) = @_;
 
     # Create new telnet session
-    my $conn = Net::Telnet->new(Prompt => '/'.CLI_PROMPT.'/',
+    my $cli = Net::Telnet->new(Prompt => '/'.CLI_PROMPT.'/',
 				Errmode => 'return',
 				Timeout => 10);
 
-    return undef unless defined($conn);
+    return undef unless defined($cli);
 
     # Telnet to remote network device
-    $conn->open($device)
+    $cli->open($device)
 	or return undef;
 
     print_stdout($frontend, "Connected to remote network device ".$device."\n") if $debug;
@@ -318,57 +320,90 @@ sub device_connect($$$$;$)
     # Send username, if defined
     if(defined($user) && $user ne '') {
 	print_stdout($frontend, "Sending username\n") if $debug;
-	unless($conn->waitfor('/(?:[Uu]ser(?:name)?|[Ll]ogin):/')) {
+	unless($cli->waitfor('/(?:[Uu]ser(?:name)?|[Ll]ogin):/')) {
 	    print_stderr($frontend, "Username failed\n") if $debug;
-	    $conn->close();
+	    $cli->close();
 	    return undef;
 	}
-	$conn->put($user."\n");
+	$cli->put($user."\n");
     }
 
     # Send password, if defined
     if(defined($pass) && $pass ne '') {
 	print_stdout($frontend, "Sending password\n") if $debug;
-	unless($conn->waitfor('/[Pp]ass(?:word)?:/')) {
+	unless($cli->waitfor('/[Pp]ass(?:word)?:/')) {
 	    print_stderr($frontend, "Password failed\n") if $debug;
-	    $conn->close();
+	    $cli->close();
 	    return undef;
 	}
-	$conn->cmd($pass)
+	$cli->cmd($pass)
 	    or return undef;
     }
 
     print_stdout($frontend, "Authenticated to remote network device ".$device."\n") if $debug;
 
-    return $conn;
+    return $cli;
 }
 
 sub device_daemon($$;$$$$$)
 {
-    # Fork into background
+    # Fork child process that will,
+    # in turn, fork the actual daemon
+    # completely dissociated from us
     my $pid = fork();
     return 0 unless defined($pid);
-    return 1 if $pid > 0;
+    if($pid > 0) {
+	# Wait for child to fork the daemon and exit
+	waitpid($pid, 0);
+	return 1;
+    }
 
-    # Daemon process starts here
-    my ($sockpath, $device, $type, $user, $pass, $debug, $maxidle) = @_;
-    my ($func_ping, $func_parse);
-    my ($conn, $detected);
+    # Child process starts here
 
-    # Initial daemon process's title
-    my $baseproctitle = $PROGRAM." daemon";
-    my $proctitle = $baseproctitle;
-    $0 = $proctitle;
+    chdir("/tmp");
+    close(STDIN);
+    close(STDOUT);
+    close(STDERR);
+
+    # Create process to new session
+    setsid();
 
     # Disable common signals that
     # could terminate the daemon
-    $SIG{'PIPE'} =
+    $SIG{'ALRM'} =
     $SIG{'TERM'} =
+    $SIG{'PIPE'} =
+    $SIG{'CHLD'} =
     $SIG{'INT'} =
     $SIG{'HUP'} = 'IGNORE';
 
-    # Remove stale UNIX socket if present
+    # Disable host/service check timeout
+    # we may have inherited from Nagios
+    alarm(0);
+
+    # Fork the daemon into background
+    $pid = fork();
+    exit() unless(defined($pid) && $pid == 0);
+
+    # Daemon process starts here
+
+    my ($sockpath, $device, $type, $user, $pass, $debug, $maxidle) = @_;
+
+    # If UNIX socket is present ...
     if(-S $sockpath) {
+	# ... try to connect
+	my $sock = IO::Socket::UNIX->new(Type => &SOCK_STREAM,
+					 Peer => $sockpath);
+	# If connected successfully,
+	# another daemon is already
+	# listening on this socket
+	if(defined($sock)) {
+	    # Close it ...
+	    $sock->close();
+	    # ... and quit
+	    exit();
+	}
+	# Otherwise, remove stale socket
 	unlink($sockpath);
     }
 
@@ -378,18 +413,25 @@ sub device_daemon($$;$$$$$)
 					 Listen => &SOMAXCONN,
 					 Blocking => 0);
 
-    exit(RC_UNKNOWN) unless defined($listener);
+    exit() unless defined($listener);
 
     # Monitor listener socket for incoming connections
     my $select = IO::Select->new();
     $select->add($listener);
 
-    my $idle_timeout = time() + $maxidle;
-    my $cmd_timeout;
+    # Initial daemon process's title
+    my $baseproctitle = "no cli session";
+    my $proctitle = $baseproctitle;
+    $0 = $proctitle;
+
+    my ($func_ping, $func_parse);
+    my ($frontend, $cli, $params);
+    my $detected;
 
     my @requests = ();
-    my $frontend;
-    my $params;
+
+    my $idle_timeout = time() + $maxidle;
+    my $cmd_timeout;
 
     # Main loop will run as long as
     # daemon is not idle for more
@@ -474,10 +516,10 @@ sub device_daemon($$;$$$$$)
 		next;
 	    }
 	    # If not connected to the device yet ...
-	    unless(defined($conn)) {
+	    unless(defined($cli)) {
 		# ... attempt to connect now
-		$conn = device_connect($socket, $device, $user, $pass, $debug);
-		unless(defined($conn)) {
+		$cli = device_connect($socket, $device, $user, $pass, $debug);
+		unless(defined($cli)) {
 		    print_stderr($socket, "Failed to connect to network device ".$device."\n") if $debug;
 		    return_code($socket, RC_UNKNOWN);
 		    $select->remove($socket);
@@ -487,7 +529,7 @@ sub device_daemon($$;$$$$$)
 		# If device type wasn't specified ...
 		unless(defined($type) && $type ne '') {
 		    # ... attempt to detect it
-		    $detected = detect_device_type($conn);
+		    $detected = detect_device_type($cli);
 		    # If device type was detected ...
 		    if(defined($detected) && $detected ne '') {
 			print_stdout($socket, "Detected network device type ".$detected."\n") if $debug;
@@ -497,7 +539,7 @@ sub device_daemon($$;$$$$$)
 		    }
 		}
 		# Set daemon proctitle to reflect connected state
-		$proctitle = $baseproctitle." connected to ".$device;
+		$proctitle = "cli session established with ".$device;
 		$0 = $proctitle;
 	    }
 	    # If device-specific functions aren't known ...
@@ -523,11 +565,11 @@ sub device_daemon($$;$$$$$)
 
 	    # Set telnet cmd (send command, wait for prompt) timeout
 	    $cmd_timeout = $params->{'timeout'} * ($params->{'packets'} + 1);
-	    $conn->timeout($cmd_timeout);
+	    $cli->timeout($cmd_timeout);
 	    $cmd_timeout += time();
 
 	    # Start pinging the target
-	    if($func_ping->($conn, %{$params})) {
+	    if($func_ping->($cli, %{$params})) {
 		# Keep active frontend's socket
 		# until request has been completed
 		$frontend = $socket;
@@ -542,13 +584,13 @@ sub device_daemon($$;$$$$$)
 		print_stderr($socket, "Command failed\n") if $debug;
 		return_code($socket, RC_UNKNOWN);
 		# Also ...
-		if(defined($conn)) {
+		if(defined($cli)) {
 		    # ... close the connection in case
 		    # command failed because something
 		    # messed up the CLI session
-		    $conn->close();
+		    $cli->close();
 		    # Force daemon to reconnect
-		    undef $conn;
+		    undef $cli;
 		    # Change proctitle to reflect our disconnected state
 		    $proctitle = $baseproctitle;
 		}
@@ -566,13 +608,13 @@ sub device_daemon($$;$$$$$)
 	# Ping in progress ?
 	if(defined($frontend)) {
 	    # Check if ping command finished
-	    my ($output) = $conn->waitfor(Match => '/'.CLI_PROMPT.'/', Timeout => 1);
+	    my ($output) = $cli->waitfor(Match => '/'.CLI_PROMPT.'/', Timeout => 1);
 	    # If we got output, command has finished
 	    if(defined($output) && $output ne '') {
 		# Split command output into separate lines
 		my @results = split(/[\n\r]/, $output);
 		# Parse command output
-		my $stats = $func_parse->($conn, \@results, %{$params});
+		my $stats = $func_parse->($cli, \@results, %{$params});
 		# If we received ping statistics ...
 		if(defined($stats)) {
 		    # ... send them to the frontend
@@ -592,12 +634,12 @@ sub device_daemon($$;$$$$$)
 		print_stderr($frontend, "Command failed\n") if $debug;
 		return_code($frontend, RC_UNKNOWN);
 		# If command was aborted or timed out ...
-		if(defined($conn)) {
+		if(defined($cli)) {
 		    # ... close the connection in case
 		    # something messed up CLI session
-		    $conn->close();
+		    $cli->close();
 		    # Force daemon to reconnect
-		    undef $conn;
+		    undef $cli;
 		    # Change proctitle to reflect our disconnected state
 		    $proctitle = $baseproctitle;
 		}
@@ -614,11 +656,11 @@ sub device_daemon($$;$$$$$)
     }
 
     # If connected to the remote device ...
-    if(defined($conn)) {
+    if(defined($cli)) {
 	# ... end CLI session
-	$conn->put("exit");
+	$cli->put("exit");
 	# ... close telnet session
-	$conn->close();
+	$cli->close();
     }
 
     # If listening on UNIX socket ...
@@ -811,8 +853,8 @@ sub main()
 
     my $run = 1;
 
+    # On SIGTERM or SIGINT, end the main loop
     $SIG{'TERM'} = $SIG{'INT'} = sub { $run = 0; };
-    $SIG{'PIPE'} = $SIG{'HUP'} = 'IGNORE';
 
     # Add auth digest to parameters
     $params{'digest'} = ipc_digest($user, $pass);
@@ -922,7 +964,7 @@ sub main()
 
 sub __ios_ping($;%)
 {
-    my $conn = shift;
+    my $cli = shift;
 
     # Get ping parameters
     my ($frontend, $enable, $target, $af, $source, $packets, $size, $timeout, $vrf, $debug) =
@@ -933,9 +975,9 @@ sub __ios_ping($;%)
     # Change to enable mode, if defined
     if(defined($enable) && $enable ne '') {
 	print_stdout($frontend, "Sending enable password\n") if $debug;
-	$conn->cmd(String => "enable", Prompt => '/[Pp]assword:/', Timeout => 1);
-	unless($conn->cmd(String => $enable, Prompt => '/#$/', Timeout => 1)) {
-	    $conn->cmd("\n\n");
+	$cli->cmd(String => "enable", Prompt => '/[Pp]assword:/', Timeout => 1);
+	unless($cli->cmd(String => $enable, Prompt => '/#$/', Timeout => 1)) {
+	    $cli->cmd("\n\n");
 	    print_stderr($frontend, "Enable failed\n") if $debug;
 	    return 0;
 	}
@@ -981,14 +1023,14 @@ sub __ios_ping($;%)
     print_stdout($frontend, "Executing ".$cmd) if $debug;
 
     # Issue ping command and get the command's output
-    $conn->put($cmd);
+    $cli->put($cmd);
 
     return 1;
 }
 
 sub __ios_parse($$;%)
 {
-    my $conn = shift;
+    my $cli = shift;
     my $output = shift;
 
     # Get ping parameters
@@ -997,7 +1039,7 @@ sub __ios_parse($$;%)
     my %result;
 
     # Exit privileged mode, if there was one
-    $conn->cmd(String => "disable", Timeout => 1);
+    $cli->cmd(String => "disable", Timeout => 1);
 
     # The last line of output contains the ping summary
     my $summary = pop @{$output};
@@ -1020,7 +1062,7 @@ sub __ios_parse($$;%)
 
 sub __iosxr_ping($;%)
 {
-    my $conn = shift;
+    my $cli = shift;
 
     # Get ping parameters
     my ($frontend, $target, $af, $source, $packets, $size, $timeout, $vrf, $debug) =
@@ -1064,14 +1106,14 @@ sub __iosxr_ping($;%)
     print_stdout($frontend, "Executing ".$cmd) if $debug;
 
     # Issue ping command
-    $conn->put($cmd);
+    $cli->put($cmd);
 
     return 1;
 }
 
 sub __iosxr_parse($$;%)
 {
-    my $conn = shift;
+    my $cli = shift;
     my $output = shift;
 
     # Get ping parameters
@@ -1099,7 +1141,7 @@ sub __iosxr_parse($$;%)
 
 sub __force10_ping($;%)
 {
-    my $conn = shift;
+    my $cli = shift;
 
     # Get ping parameters
     my ($frontend, $target, $source, $packets, $size, $timeout, $debug) =
@@ -1131,14 +1173,14 @@ sub __force10_ping($;%)
     print_stdout($frontend, "Executing ".$cmd) if $debug;
 
     # Issue ping command
-    $conn->put($cmd);
+    $cli->put($cmd);
 
     return 1;
 }
 
 sub __force10_parse($$;%)
 {
-    my $conn = shift;
+    my $cli = shift;
     my $output = shift;
 
     # Get ping parameters
@@ -1166,7 +1208,7 @@ sub __force10_parse($$;%)
 
 sub __powerconnect_ping($;%)
 {
-    my $conn = shift;
+    my $cli = shift;
 
     # Get ping parameters
     my ($frontend, $target, $af, $packets, $size, $timeout, $debug) =
@@ -1201,14 +1243,14 @@ sub __powerconnect_ping($;%)
     print_stdout($frontend, "Executing ".$cmd) if $debug;
 
     # Issue ping command
-    $conn->put($cmd);
+    $cli->put($cmd);
 
     return 1;
 }
 
 sub __powerconnect_parse($$;%)
 {
-    my $conn = shift;
+    my $cli = shift;
     my $output = shift;
 
     # Get ping parameters
@@ -1236,7 +1278,7 @@ sub __powerconnect_parse($$;%)
 
 sub __junos_ping($;%)
 {
-    my $conn = shift;
+    my $cli = shift;
 
     # Get ping parameters
     my ($frontend, $target, $af, $source, $packets, $size, $timeout, $vrf, $debug) =
@@ -1246,7 +1288,7 @@ sub __junos_ping($;%)
 
     # We must explicitly set screen width to maximum.
     # Otherwise, commands we issue will be truncated
-    $conn->cmd("set cli screen-width 1024");
+    $cli->cmd("set cli screen-width 1024");
 
     # Format ping command
     my $cmd = "ping ".$target." rapid";
@@ -1283,14 +1325,14 @@ sub __junos_ping($;%)
     print_stdout($frontend, "Executing ".$cmd) if $debug;
 
     # Issue ping command 
-    $conn->put($cmd);
+    $cli->put($cmd);
 
     return 1;
 }
 
 sub __junos_parse($$;%)
 {
-    my $conn = shift;
+    my $cli = shift;
     my $output = shift;
 
     # Get ping parameters
