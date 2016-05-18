@@ -1,5 +1,5 @@
-Unofficial Nagios plugins contributions
-=======================================
+Miscellaneous Nagios plugins
+============================
 
 check_network_device_ping
 -------------------------
