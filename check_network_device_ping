@@ -216,15 +216,21 @@ sub nslookup($)
 sub ipc_read($)
 {
     my $socket = shift;
+    my $data;
 
-    return fd_retrieve($socket);
+    eval { $data = fd_retrieve($socket); };
+
+    return $data;
 }
 
 sub ipc_write($$)
 {
     my ($socket, $data) = @_;
+    my $res;
 
-    return nstore_fd($data, $socket);
+    eval { $res = nstore_fd($data, $socket); };
+
+    return $res;
 }
 
 sub ipc_digest($$)
@@ -234,7 +240,7 @@ sub ipc_digest($$)
     $user = '' unless defined($user);
     $pass = '' unless defined($pass);
 
-    return md5_base64("\0".length($user)."\0".length($pass)."\0".$user.":".$pass);
+    return md5_base64("\'".$user."\':\'".$pass."\'");
 }
 
 #########################################################################
@@ -491,6 +497,7 @@ sub device_daemon($$;$$$$$)
 	    next unless defined($params);
 	    # Requesting frontend's UNIX socket
 	    my $socket = $params->{'frontend'};
+	    next unless $select->exists($socket);
 	    # If params contain debug flag (as they should) ...
 	    if(defined($params->{'debug'})) {
 		# ... replace daemon's current debug setting
@@ -594,9 +601,8 @@ sub device_daemon($$;$$$$$)
 		    # Change proctitle to reflect our disconnected state
 		    $proctitle = $baseproctitle;
 		}
-		# ... stop monitoring socket for events
+		# Disconnect the frontend
 		$select->remove($socket);
-		# ... and disconnect the frontend
 		$socket->close();
 	    }
 
@@ -644,9 +650,8 @@ sub device_daemon($$;$$$$$)
 		    $proctitle = $baseproctitle;
 		}
 	    }
-	    # Stop monitoring socket for events
-	    $select->remove($frontend);
 	    # Disconnect the frontend
+	    $select->remove($frontend);
 	    $frontend->close();
 	    # Make us idle again
 	    undef $frontend;
