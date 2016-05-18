@@ -167,11 +167,11 @@ sub nslookup($)
 
     # getaddrinfo() and getnameinfo() are a mess - they are
     # missing from Socket module on some linux distributions
-    # (or are otherwise unavailable), but not all. They can
-    # also be found in Socket6 and Socket::GetAddrInfo modules,
-    # but these are not installed by default. We will look for
-    # them in all those places and if they are not found, we
-    # will fall back to shell command 'host' (if installed).
+    # (or are otherwise unavailable), they can also be found
+    # in Socket6 and Socket::GetAddrInfo modules, but these
+    # are not usually installed by default. We will look for
+    # these functions everywhere and if they are not found,
+    # we will fall back to the 'host' command (if installed).
 
     eval {
 	eval {
