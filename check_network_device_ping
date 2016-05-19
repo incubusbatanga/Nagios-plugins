@@ -28,7 +28,7 @@ our ($PROGRAM, $VERSION, $USAGE);
 
 ($PROGRAM) = ($0 =~ /([^\/]+)$/);
 
-$VERSION = "0.3";
+$VERSION = "0.4";
 
 #########################################################################
 ##      O P T I O N A L   S T A T I C   C O N F I G U R A T I O N      ##
@@ -60,6 +60,7 @@ $VERSION = "0.3";
 
 #########################################################################
 
+# Nagios plugin exit codes
 use constant {
     RC_OK		=> 0,
     RC_WARNING		=> 1,
@@ -67,9 +68,18 @@ use constant {
     RC_UNKNOWN		=> 3
 };
 
+# Device prompt regular expressions
 use constant {
     CLI_PROMPT		=> '.*?[>#]\s*$',
     PAGE_MARKER		=> '\-+\s*More\s*\-+'
+};
+
+# Data type regular expressions
+use constant {
+    T_INTEGER		=> '[\+\-]?\d+',
+    T_FLOAT		=> '[\+\-]?\d+(?:\.\d+)?',
+    T_IPV4		=> '\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}(?:\/\d{1,2})?',
+    T_IPV6		=> '[a-fA-F\d]{0,4}(?:\:(?!\:\:)[a-fA-F\d]{1,4}){0,6}(?:\:\:)?(?:[a-fA-F\d]{1,4}\:(?!\:\:)){0,6}[a-fA-F\d]{0,4}(?:\/\d{1,2})?'
 };
 
 #########################################################################
@@ -150,15 +160,57 @@ sub error(;$)
     return RC_UNKNOWN;
 }
 
+sub is_dir($)
+{
+    return (defined($_[0]) && $_[0] ne '' && -d $_[0]) ? 1:0;
+}
+
 sub is_ipv4($)
 {
-    return (defined($_[0]) && $_[0] =~ /^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}(?:\/\d{1,2})?$/) ? 1:0;
+    return (defined($_[0]) && $_[0] =~ /^@{[T_IPV4]}$/) ? 1:0;
 }
 
 sub is_ipv6($)
 {
-    return (defined($_[0]) && $_[0] =~ /^[a-fA-F\d]{0,4}(?:\:(?!\:\:)[a-fA-F\d]{1,4}){0,6}(?:\:\:)?(?:[a-fA-F\d]{1,4}\:(?!\:\:)){0,6}[a-fA-F\d]{0,4}(?:\/\d{1,2})?$/) ? 1:0;
+    return (defined($_[0]) && $_[0] =~ /^@{[T_IPV6]}$/) ? 1:0;
 }
+
+sub is_int($;$$)
+{
+    my $num = shift;
+
+    return 0 unless(defined($num) && $num =~ /^@{[T_INTEGER]}$/);
+
+    my $lower = shift;
+    if(defined($lower) && $lower =~ /^@{[T_FLOAT]}$/) {
+	return 0 if $num < $lower;
+	my $upper = shift;
+	if(defined($upper) && $upper =~ /^@{[T_FLOAT]}$/ && $upper >= $lower) {
+	    return 0 if $num > $upper;
+	}
+    }
+
+    return 1;
+}
+
+sub is_float($;$$)
+{
+    my $num = shift;
+
+    return 0 unless(defined($num) && $num =~ /^@{[T_FLOAT]}$/);
+
+    my $lower = shift;
+    if(defined($lower) && $lower =~ /^@{[T_FLOAT]}$/) {
+	return 0 if $num < $lower;
+	my $upper = shift;
+	if(defined($upper) && $upper =~ /^@{[T_FLOAT]}$/ && $upper >= $lower) {
+	    return 0 if $num > $upper;
+	}
+    }
+
+    return 1;
+}
+
 
 sub nslookup($)
 {
@@ -695,14 +747,9 @@ sub main()
 {
     my %cf = (%CONFIG_DEFAULTS, %CONFIG);
 
-    return error "Script config is invalid/incomplete" unless(defined($cf{'maxattempts'}) &&
-								      $cf{'maxattempts'} =~ /^\d+$/ &&
-								      $cf{'maxattempts'} >= 0 &&
-							      defined($cf{'maxidle'}) &&
-								      $cf{'maxidle'} =~ /^\d+$/ &&
-								      $cf{'maxidle'} >= 0 &&
-							      defined($cf{'sockdir'}) &&
-								      -d $cf{'sockdir'});
+    return error "Script config is invalid/incomplete" unless(is_int($cf{'maxattempts'}, 1) &&
+							      is_int($cf{'maxidle'}, 1) &&
+							      is_dir($cf{'sockdir'}));
 
     my %opts = ();
 
@@ -756,19 +803,19 @@ sub main()
 	} elsif($opt eq 'p') {
 	    return error "Missing packet count" unless defined($val);
 	     # Set the number of packets to ping with
-	    $params{'packets'} = $val if($val =~ /^\d+$/ && $val > 0);
+	    $params{'packets'} = $val if is_int($val, 1);
 	} elsif($opt eq 's') {
 	    return error "Missing packet size" unless defined($val);
 	    # Set the ping packet size
-	    $params{'size'} = $val if($val =~ /^\d+$/ && $val > 35);
+	    $params{'size'} = $val if is_int($val, 36);
 	} elsif($opt eq 't') {
 	    return error "Missing ping timeout" unless defined($val);
 	    # Set the ping timeout
-	    $params{'timeout'} = $val if($val =~ /^\d+$/ && $val > 0);
+	    $params{'timeout'} = $val if is_int($val, 1);
 	} elsif($opt eq 'w') {
 	    return error "Missing warning thresholds" unless $val ne '';
 	    # Extract average RTT and packed loss thresholds
-	    ($warn_rta, $warn_pl) = ($val =~ /^(\d+),(\d+)\%$/);
+	    ($warn_rta, $warn_pl) = ($val =~ /^(@{[T_FLOAT]}),(@{[T_FLOAT]})\%$/);
 	    unless(defined($warn_rta) && $warn_rta ne '' &&
 		   defined($warn_pl) && $warn_pl ne '') {
 		return error "Invalid warning thresholds ".$val;
@@ -776,7 +823,7 @@ sub main()
 	} elsif($opt eq 'c') {
 	    return error "Missing critical thresholds" unless $val ne '';
 	    # Extract average RTT and packed loss thresholds
-	    ($crit_rta, $crit_pl) = ($val =~ /^(\d+),(\d+)\%$/);
+	    ($crit_rta, $crit_pl) = ($val =~ /^(@{[T_FLOAT]}),(@{[T_FLOAT]})\%$/);
 	    unless(defined($crit_rta) && $crit_rta ne '' &&
 		   defined($crit_pl) && $crit_pl ne '') {
 		return error "Invalid critical thresholds ".$val;
@@ -799,18 +846,10 @@ sub main()
 				$params{'target'} ne '' &&
 			defined($device) &&
 				$device ne '' &&
-			defined($warn_rta) &&
-				$warn_rta =~ /^\d+$/ &&
-				$warn_rta >= 0 &&
-			defined($warn_pl) &&
-				$warn_pl  =~ /^\d+$/ &&
-				$warn_pl >= 0 &&
-			defined($crit_rta) &&
-				$crit_rta =~ /^\d+$/ &&
-				$crit_rta >= 0 &&
-			defined($crit_pl) &&
-				$crit_pl =~ /^\d+$/ &&
-				$crit_pl >= 0);
+			is_float($warn_rta, 0) &&
+			is_float($warn_pl, 0) &&
+			is_float($crit_rta, 0) &&
+			is_float($crit_pl, 0));
 
     # Resolve network device name into an IPv4/IPv6 address
     my $devaddr = (is_ipv4($device) || is_ipv6($device)) ? $device:nslookup($device);
@@ -921,19 +960,27 @@ sub main()
 	print "Ping stats: ".Dumper($stats)."\n";
     }
 
-    # We must have at least the number of sent/received packets
-    return RC_UNKNOWN unless(defined($stats->{'received'}) &&
-				     $stats->{'received'} =~ /^\d+(?:\.\d+)?$/ &&
-			     defined($stats->{'sent'}) &&
-				     $stats->{'sent'} =~ /^\d+(?:\.\d+)?$/);
+    # We must at least have the number of sent/received packets
+    return RC_UNKNOWN unless(is_float($stats->{'sent'}, 1) &&
+			     is_float($stats->{'received'}, 0, $stats->{'sent'}));
 
-    # Calculate packet loss percentage
-    my $packet_loss = sprintf("%.2f", (100 * (1 - ($stats->{'received'} / $stats->{'sent'}))));
+    my $packet_loss;
 
-    # Format average RTT
-    my $rtt_average = (defined($stats->{'rttavg'}) &&
-		       $stats->{'rttavg'} =~ /^\d+(?:\.\d+)?$/) ?
-					sprintf("%.2f", $stats->{'rttavg'}):undef;
+    # If packet loss was reported ...
+    if(is_float($stats->{'packetloss'}, 0)) {
+	# ... use it directly
+	$packet_loss = sprintf("%.2f", $stats->{'packetloss'});
+    # Otherwise ...
+    } else {
+	# ... calculate packet loss percentage using
+	# the number of sent and received packets
+	$packet_loss = sprintf("%.2f", (100.00 * (1.00 - ($stats->{'received'} / $stats->{'sent'}))));
+    }
+
+    # Format RTT statistics
+    my $rtt_min = is_float($stats->{'rttmin'}) ? sprintf("%.2f", $stats->{'rttmin'}):undef;
+    my $rtt_avg = is_float($stats->{'rttavg'}) ? sprintf("%.2f", $stats->{'rttavg'}):undef;
+    my $rtt_max = is_float($stats->{'rttmax'}) ? sprintf("%.2f", $stats->{'rttmax'}):undef;
 
     my $rc = RC_OK;
 
@@ -941,13 +988,13 @@ sub main()
     if($packet_loss >= $crit_pl) {
 	$rc = RC_CRITICAL;
     # Check if RTT average exceeds user-specified critical level
-    } elsif(defined($rtt_average) && $rtt_average >= $crit_rta) {
+    } elsif(defined($rtt_avg) && $rtt_avg >= $crit_rta) {
 	$rc = RC_CRITICAL;
     # Check if packet loss exceeds user-specified warning level
     } elsif($packet_loss >= $warn_pl) {
 	$rc = RC_WARNING;
     # Check if RTT average exceeds user-specified warning level
-    } elsif(defined($rtt_average) && $rtt_average >= $warn_rta) {
+    } elsif(defined($rtt_avg) && $rtt_avg >= $warn_rta) {
 	$rc = RC_WARNING;
     }
 
@@ -958,7 +1005,11 @@ sub main()
     );
 
     print "PING ".$rc_str{$rc}." - Packet loss = ".$packet_loss."%";
-    print ", RTA = ".$rtt_average." ms" if defined($rtt_average);
+    print ", RTA = ".$rtt_avg." ms" if defined($rtt_avg);
+    print " | packet_loss=".$packet_loss." packets_transmitted=".$stats->{'sent'}." packets_received=".$stats->{'received'};
+    print " rtt_min=".$rtt_min if defined($rtt_min);
+    print " rtt_avg=".$rtt_avg if defined($rtt_avg);
+    print " rtt_max=".$rtt_max if defined($rtt_max);
     print "\n";
 
     return $rc;
@@ -1057,7 +1108,11 @@ sub __ios_parse($$;%)
     print_stdout($frontend, $summary."\n") if $debug;
 
     # Extract summary information
-    @result{('received', 'sent', 'rttmin', 'rttavg', 'rttmax')} = ($summary =~ /^Success rate is \d+ percent \((\d+)\/(\d+)\)(?:, round\-trip min\/avg\/max = (\d+)\/(\d+)\/(\d+) ms)?$/i);
+    my ($successrate, @values) = ($summary =~ /^Success rate is (@{[T_FLOAT]}) percent \((@{[T_FLOAT]})\/(@{[T_FLOAT]})\)(?:, round\-trip min\/avg\/max = (@{[T_FLOAT]})\/(@{[T_FLOAT]})\/(@{[T_FLOAT]}) ms)?$/i);
+    return undef unless is_float($successrate, 0, 100);
+
+    # Pack extracted ping statistics into result 'struct'
+    @result{('packetloss', 'received', 'sent', 'rttmin', 'rttavg', 'rttmax')} = (100.00 - $successrate, (@values));
 
     return \%result;
 }
@@ -1136,7 +1191,11 @@ sub __iosxr_parse($$;%)
     print_stdout($frontend, $summary."\n") if $debug;
 
     # Extract summary information
-    @result{('received', 'sent', 'rttmin', 'rttavg', 'rttmax')} = ($summary =~ /^Success rate is \d+ percent \((\d+)\/(\d+)\)(?:, round\-trip min\/avg\/max = (\d+)\/(\d+)\/(\d+) ms)?$/i);
+    my ($successrate, @values) = ($summary =~ /^Success rate is (@{[T_FLOAT]}) percent \((@{[T_FLOAT]})\/(@{[T_FLOAT]})\)(?:, round\-trip min\/avg\/max = (@{[T_FLOAT]})\/(@{[T_FLOAT]})\/(@{[T_FLOAT]}) ms)?$/i);
+    return undef unless is_float($successrate, 0, 100);
+
+    # Pack extracted ping statistics into result 'struct'
+    @result{('packetloss', 'received', 'sent', 'rttmin', 'rttavg', 'rttmax')} = (100.00 - $successrate, @values);
 
     return \%result;
 }
@@ -1203,7 +1262,11 @@ sub __force10_parse($$;%)
     print_stdout($frontend, $summary."\n") if $debug;
 
     # Extract summary information
-    @result{('received', 'sent', 'rttmin', 'rttavg', 'rttmax')} = ($summary =~ /^Success rate is \d+(?:\.\d+)? percent \((\d+)\/(\d+)\)(?:, round\-trip min\/avg\/max = (\d+)\/(\d+)\/(\d+) \(ms\))?$/i);
+    my ($successrate, @values) = ($summary =~ /^Success rate is (@{[T_FLOAT]}) percent \((@{[T_FLOAT]})\/(@{[T_FLOAT]})\)(?:, round\-trip min\/avg\/max = (@{[T_FLOAT]})\/(@{[T_FLOAT]})\/(@{[T_FLOAT]}) \(ms\))?$/i);
+    return undef unless is_float($successrate, 0, 100);
+
+    # Pack extracted ping statistics into result 'struct'
+    @result{('packetloss', 'received', 'sent', 'rttmin', 'rttavg', 'rttmax')} = (100.00 - $successrate, @values);
 
     return \%result;
 }
@@ -1264,10 +1327,10 @@ sub __powerconnect_parse($$;%)
     my %result;
 
     while(defined(my $line = pop @{$output})) {
-	if($line =~ /^round\-trip \(msec\) min\/avg\/max = (\d+)\/(\d+)\/(\d+)$/i) {
+	if($line =~ /^round\-trip \(msec\) min\/avg\/max = (@{[T_FLOAT]})\/(@{[T_FLOAT]})\/(@{[T_FLOAT]})$/i) {
 	    @result{('rttmin', 'rttavg', 'rttmax')} = ($1, $2, $3);
-	} elsif($line =~ /^(\d+) packets transmitted, (\d+) packets received, \d+(\.\d+)?% packet loss$/i) {
-	    @result{('sent','received')} = ($1, $2);
+	} elsif($line =~ /^(@{[T_FLOAT]}) packets transmitted, (@{[T_FLOAT]}) packets received, (@{[T_FLOAT]})% packet loss$/i) {
+	    @result{('sent','received','packetloss')} = ($1, $2, $3);
 	    $output = [];
 	} else {
 	    next;
@@ -1347,10 +1410,10 @@ sub __junos_parse($$;%)
     my %result;
 
     while(defined(my $line = pop @{$output})) {
-	if($line =~ /^round-trip min\/avg\/max\/std\-?dev = (\d+(?:\.\d+)?)\/(\d+(?:\.\d+)?)\/(\d+(?:\.\d+)?)\/\d+(?:\.\d+)? ms$/i) {
+	if($line =~ /^round-trip min\/avg\/max\/std\-?dev = (@{[T_FLOAT]})\/(@{[T_FLOAT]})\/(@{[T_FLOAT]})\/@{[T_FLOAT]} ms$/i) {
 	    @result{('rttmin', 'rttavg', 'rttmax')} = ($1, $2, $3);
-	} elsif($line =~ /^(\d+) packets transmitted, (\d+) packets received, \d+(\.\d+)?% packet loss$/i) {
-	    @result{('sent','received')} = ($1, $2);
+	} elsif($line =~ /^(@{[T_FLOAT]}) packets transmitted, (@{[T_FLOAT]}) packets received, (@{[T_FLOAT]})% packet loss$/i) {
+	    @result{('sent','received', 'packetloss')} = ($1, $2, $3);
 	    $output = [];
 	} else {
 	    next;
